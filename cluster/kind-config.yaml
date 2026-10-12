@@ -1,0 +1,10 @@
+# kind cluster for the AI observability lab.
+# Docs: https://kind.sigs.k8s.io/docs/user/configuration/
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: obs-lab
+nodes:
+  - role: control-plane
+    # Pinned to a node image published for kind v0.33.0 (see its release notes).
+    # v1.36 matches the local kubectl client minor version.
+    image: kindest/node:v1.36.4@sha256:099e049362a1526b2db71494e1947aae99bd16290d7c895f2b7ea312e3cbfaed

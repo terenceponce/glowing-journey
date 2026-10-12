@@ -26,4 +26,12 @@ Work is tracked in [GitHub Issues](https://github.com/terenceponce/glowing-journ
 
 ## Getting started
 
-Not runnable yet. Setup instructions will land here as `make` targets once the cluster task (#1) is done.
+Prerequisites: Docker Desktop (10 GB+ memory), `kubectl`, and `brew install kind helm`.
+
+```sh
+make cluster-up      # create the kind cluster and namespaces
+make cluster-status  # nodes, namespaces, pods
+make cluster-down    # delete the cluster
+```
+
+See [docs/cluster.md](docs/cluster.md) for details.
