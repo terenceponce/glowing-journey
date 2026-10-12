@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>K8s Docs Chat</title>
+<style>
+  :root { --bg: #f6f7f9; --fg: #1d2330; --muted: #667085; --card: #fff; --line: #e3e6eb; --accent: #326ce5; --user: #e8effd; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #14171c; --fg: #e6e8ec; --muted: #98a2b3; --card: #1d2129; --line: #2e3440; --accent: #6e9bff; --user: #22304a; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.5 system-ui, sans-serif; }
+  main { max-width: 820px; margin: 0 auto; padding: 16px; display: flex; flex-direction: column; min-height: 100vh; }
+  header { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  .meta { color: var(--muted); font-size: 12px; }
+  button.link { background: none; border: 0; color: var(--accent); cursor: pointer; font: inherit; padding: 0; }
+  #log { flex: 1; display: flex; flex-direction: column; gap: 12px; padding: 16px 0; }
+  .msg { padding: 10px 14px; border-radius: 10px; border: 1px solid var(--line); background: var(--card); white-space: pre-wrap; overflow-wrap: anywhere; }
+  .msg.user { background: var(--user); align-self: flex-end; max-width: 85%; }
+  .msg.error { border-color: #d92d20; color: #d92d20; }
+  .msg.pending { color: var(--muted); }
+  details { margin-top: 8px; white-space: normal; font-size: 13px; }
+  summary { cursor: pointer; color: var(--muted); }
+  ol.sources { margin: 6px 0 0; padding-left: 22px; }
+  ol.sources li { margin-bottom: 6px; }
+  ol.sources code { font-size: 12px; }
+  .snippet { color: var(--muted); }
+  /* Placeholder for thumbs up/down feedback buttons (next task). */
+  .feedback { margin-top: 6px; display: flex; gap: 6px; }
+  .feedback:empty { display: none; }
+  form { display: flex; gap: 8px; position: sticky; bottom: 0; background: var(--bg); padding: 8px 0 4px; }
+  textarea { flex: 1; resize: vertical; min-height: 44px; padding: 10px; border-radius: 8px; border: 1px solid var(--line); background: var(--card); color: var(--fg); font: inherit; }
+  form button { padding: 0 18px; border: 0; border-radius: 8px; background: var(--accent); color: #fff; font: inherit; cursor: pointer; }
+  form button:disabled { opacity: .5; cursor: default; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div>
+      <h1>Kubernetes docs chat</h1>
+      <div class="meta">Answers from the Kubernetes concepts docs · <span id="ids"></span></div>
+    </div>
+    <button class="link" id="new">New conversation</button>
+  </header>
+  <div id="log"></div>
+  <form id="form">
+    <textarea id="q" placeholder="Ask about Kubernetes, e.g. How do containers in the same Pod share storage?" required></textarea>
+    <button id="send">Send</button>
+  </form>
+</main>
+<script>
+  const store = (s, k, make) => {
+    try { let v = s.getItem(k); if (!v) { v = make(); s.setItem(k, v); } return v; } catch { return make(); }
+  };
+  const rid = () => (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random().toString(16).slice(2));
+  const userId = store(localStorage, "chat_user_id", () => "user-" + rid().slice(0, 8));
+  let sessionId = store(sessionStorage, "chat_session_id", rid);
+  const $ = (id) => document.getElementById(id);
+  const showIds = () => { $("ids").textContent = `user ${userId} · session ${sessionId.slice(0, 8)}`; };
+  showIds();
+
+  function add(cls, text) {
+    const el = document.createElement("div");
+    el.className = "msg " + cls;
+    el.textContent = text;
+    $("log").appendChild(el);
+    el.scrollIntoView({ block: "end" });
+    return el;
+  }
+
+  function renderAnswer(el, data) {
+    el.className = "msg bot";
+    el.textContent = data.answer;
+    el.dataset.messageId = data.message_id;
+    if (data.sources.length) {
+      const d = document.createElement("details");
+      d.innerHTML = `<summary>Sources (${data.sources.length}) · ${data.model}</summary><ol class="sources"></ol>`;
+      for (const s of data.sources) {
+        const li = document.createElement("li");
+        li.value = s.n;
+        const head = document.createElement("div");
+        head.textContent = `${s.title}${s.section ? " › " + s.section : ""} (score ${s.score.toFixed(3)})`;
+        const path = document.createElement("code");
+        path.textContent = `${s.source} #${s.chunk_index}`;
+        const snip = document.createElement("div");
+        snip.className = "snippet";
+        snip.textContent = s.snippet + "…";
+        li.append(head, path, snip);
+        d.querySelector("ol").appendChild(li);
+      }
+      el.appendChild(d);
+    }
+    const fb = document.createElement("div");
+    fb.className = "feedback"; // thumbs up/down go here later
+    el.appendChild(fb);
+  }
+
+  $("form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const message = $("q").value.trim();
+    if (!message) return;
+    $("q").value = "";
+    $("send").disabled = true;
+    add("user", message);
+    const pending = add("pending", "Thinking…");
+    try {
+      const r = await fetch("/chat", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ session_id: sessionId, user_id: userId, message }),
+      });
+      const data = await r.json();
+      if (!r.ok) throw new Error(typeof data.detail === "string" ? data.detail : `HTTP ${r.status}`);
+      renderAnswer(pending, data);
+    } catch (err) {
+      pending.className = "msg error";
+      pending.textContent = "Error: " + err.message;
+    } finally {
+      $("send").disabled = false;
+      $("q").focus();
+    }
+  });
+
+  $("q").addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); $("form").requestSubmit(); }
+  });
+
+  $("new").addEventListener("click", () => {
+    sessionId = rid();
+    try { sessionStorage.setItem("chat_session_id", sessionId); } catch {}
+    $("log").innerHTML = "";
+    showIds();
+  });
+</script>
+</body>
+</html>

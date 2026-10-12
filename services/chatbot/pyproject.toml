@@ -1,0 +1,19 @@
+[project]
+name = "chatbot"
+version = "0.1.0"
+description = "FastAPI RAG chatbot: Qdrant retrieval + Z.AI GLM via the OpenAI SDK"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi==0.143.0",
+    "uvicorn==0.54.0",
+    "httpx==0.28.1",
+    "qdrant-client==1.19.1",
+    "openai==3.29.0",
+]
+
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["app", "rag"]
