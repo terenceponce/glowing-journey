@@ -53,4 +53,12 @@ make query Q="How do containers in the same Pod share storage?"
 make qdrant-ui       # http://localhost:6333/dashboard
 ```
 
-See [docs/cluster.md](docs/cluster.md), [docs/langfuse.md](docs/langfuse.md) and [docs/vector-store.md](docs/vector-store.md) for details.
+Then the chatbot (needs a Z.AI key in `secrets/zai.env` as `ZAI_API_KEY=...`):
+
+```sh
+make chatbot-up      # Secret from secrets/zai.env, build, deploy to the app namespace
+make chatbot-test    # one question through POST /chat
+make chatbot-ui      # chat page at http://localhost:8080
+```
+
+See [docs/cluster.md](docs/cluster.md), [docs/langfuse.md](docs/langfuse.md), [docs/vector-store.md](docs/vector-store.md) and [docs/chatbot.md](docs/chatbot.md) for details.
