@@ -16,6 +16,7 @@ QDRANT_CHART_VERSION ?= 1.19.2
 PLATFORM       ?= linux/arm64
 EMBEDDER_IMAGE ?= embedder:0.1.1
 INGEST_IMAGE   ?= ingest:0.1.0
+CHATBOT_IMAGE  ?= chatbot:0.1.0
 
 # Corpus baked into the ingest image: a pinned commit of kubernetes/website.
 CORPUS_REPO ?= https://github.com/kubernetes/website.git
@@ -29,11 +30,22 @@ CHUNK_OVERLAP ?= 200
 EMBEDDER_URL  ?= http://embedder.app.svc.cluster.local:8000
 QDRANT_URL    ?= http://qdrant.qdrant.svc.cluster.local:6333
 
+# Chatbot settings (override like `make chatbot-up LLM_MODEL=glm-5.3-flash TOP_K=8`).
+# Z.AI general API; not the coding-plan endpoint (/api/coding/paas/v4), which is limited to coding tools.
+LLM_BASE_URL    ?= https://api.z.ai/api/paas/v4
+LLM_MODEL       ?= glm-4.7-flash
+LLM_TEMPERATURE ?= 0.2
+LLM_MAX_TOKENS  ?= 1024
+LLM_THINKING    ?= disabled
+TOP_K           ?= 5
+CHATBOT_PORT    ?= 8080
+
 .PHONY: help cluster-up cluster-down cluster-status \
 	langfuse-prereqs langfuse-secrets langfuse-up langfuse-down langfuse-purge langfuse-status langfuse-ui langfuse-test \
 	qdrant-up qdrant-down qdrant-purge qdrant-status qdrant-ui \
 	embedder-image embedder-up embedder-down embedder-test \
-	ingest-image ingest query
+	ingest-image ingest query \
+	chatbot-secret chatbot-image chatbot-up chatbot-down chatbot-status chatbot-logs chatbot-ui chatbot-test
 
 help: ## List targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-16s %s\n", $$1, $$2}'
@@ -162,3 +174,45 @@ query: ## Embed Q via the embedder and print the top-5 chunks from Qdrant (make 
 	$(KUBECTL) -n app run ingest-query --rm -i --restart=Never --quiet --image=$(INGEST_IMAGE) \
 		--env=EMBEDDER_URL=$(EMBEDDER_URL) --env=QDRANT_URL=$(QDRANT_URL) --env=COLLECTION=$(COLLECTION) \
 		-- python query.py "$(Q)"
+
+chatbot-secret: ## Create the app/zai-api Secret from secrets/zai.env (ZAI_API_KEY=...)
+	KUBECTL="$(KUBECTL)" scripts/zai-secret.sh
+
+chatbot-image: ## Build the chatbot image and load it into kind
+	docker build --platform $(PLATFORM) -t $(CHATBOT_IMAGE) services/chatbot
+	kind load docker-image $(CHATBOT_IMAGE) --name $(CLUSTER_NAME)
+
+chatbot-up: chatbot-secret chatbot-image ## Write chatbot-config, deploy the chatbot to the app namespace and wait until Ready
+	$(KUBECTL) -n app create configmap chatbot-config \
+		--from-literal=EMBEDDER_URL=$(EMBEDDER_URL) --from-literal=QDRANT_URL=$(QDRANT_URL) \
+		--from-literal=COLLECTION=$(COLLECTION) --from-literal=TOP_K=$(TOP_K) \
+		--from-literal=LLM_BASE_URL=$(LLM_BASE_URL) --from-literal=LLM_MODEL=$(LLM_MODEL) \
+		--from-literal=LLM_TEMPERATURE=$(LLM_TEMPERATURE) --from-literal=LLM_MAX_TOKENS=$(LLM_MAX_TOKENS) \
+		--from-literal=LLM_THINKING=$(LLM_THINKING) \
+		--dry-run=client -o yaml | $(KUBECTL) apply -f -
+	$(KUBECTL) apply -f deploy/app/chatbot.yaml
+	$(KUBECTL) -n app set image deploy/chatbot chatbot=$(CHATBOT_IMAGE)
+	$(KUBECTL) -n app rollout restart deploy/chatbot
+	$(KUBECTL) -n app rollout status deploy/chatbot --timeout=5m
+
+chatbot-down: ## Remove the chatbot (keeps the zai-api Secret and chatbot-config)
+	$(KUBECTL) delete -f deploy/app/chatbot.yaml --ignore-not-found
+
+chatbot-status: ## Show the chatbot pod, service and config
+	@$(KUBECTL) -n app get deploy,pods,svc -l app.kubernetes.io/name=chatbot
+	@$(KUBECTL) -n app get configmap chatbot-config -o jsonpath='{.data}'; echo
+
+chatbot-logs: ## Follow the chatbot logs
+	$(KUBECTL) -n app logs -f deploy/chatbot
+
+chatbot-ui: ## Port-forward the chat page to http://localhost:8080 (CHATBOT_PORT)
+	$(KUBECTL) -n app port-forward svc/chatbot $(CHATBOT_PORT):8000
+
+chatbot-test: ## Ask Q through POST /chat from inside the cluster and print the answer and sources
+	$(KUBECTL) -n app run chatbot-test --rm -i --restart=Never --quiet --image=$(CHATBOT_IMAGE) --env=Q="$(Q)" -- \
+		python -c "import json, os, urllib.request as u; \
+		r = u.Request('http://chatbot:8000/chat', json.dumps({'session_id': 'make-test', 'user_id': 'make-test', \
+		'message': os.environ['Q']}).encode(), {'content-type': 'application/json'}); d = json.load(u.urlopen(r, timeout=180)); \
+		print('Q:', os.environ['Q']); print('A:', d['answer']); print(); \
+		[print(f\"[{s['n']}] {s['score']:.3f} {s['source']} [{s['title']} > {s['section'] or '-'}] #{s['chunk_index']}\") for s in d['sources']]; \
+		print(); print('model', d['model'], 'usage', d['usage'])"

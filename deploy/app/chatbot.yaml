@@ -1,0 +1,71 @@
+# RAG chatbot (services/chatbot) in the `app` namespace.
+# The image is built locally and loaded with `kind load docker-image` (make chatbot-up).
+# Settings come from the `chatbot-config` ConfigMap (created by `make chatbot-up` from Makefile variables);
+# the Z.AI key comes from the `zai-api` Secret (make chatbot-secret, from secrets/zai.env).
+# In-cluster URL: http://chatbot.app.svc.cluster.local:8000
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chatbot
+  namespace: app
+  labels:
+    app.kubernetes.io/name: chatbot
+spec:
+  replicas: 1  # session history is in memory, so more replicas would split conversations
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: chatbot
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: chatbot
+    spec:
+      containers:
+        - name: chatbot
+          image: chatbot:0.1.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: chatbot-config
+          env:
+            - name: ZAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: zai-api
+                  key: ZAI_API_KEY
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: chatbot
+  namespace: app
+  labels:
+    app.kubernetes.io/name: chatbot
+spec:
+  selector:
+    app.kubernetes.io/name: chatbot
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
