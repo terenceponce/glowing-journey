@@ -9,8 +9,12 @@ LANGFUSE_CHART_VERSION      ?= 2.1.4
 CERT_MANAGER_VERSION        ?= v1.20.2
 CLICKHOUSE_OPERATOR_VERSION ?= 0.0.8
 
+# Qdrant chart (https://github.com/qdrant/qdrant-helm); app version matches the chart version.
+QDRANT_CHART_VERSION ?= 1.19.2
+
 .PHONY: help cluster-up cluster-down cluster-status \
-	langfuse-prereqs langfuse-secrets langfuse-up langfuse-down langfuse-purge langfuse-status langfuse-ui langfuse-test
+	langfuse-prereqs langfuse-secrets langfuse-up langfuse-down langfuse-purge langfuse-status langfuse-ui langfuse-test \
+	qdrant-up qdrant-down qdrant-purge qdrant-status qdrant-ui
 
 help: ## List targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-16s %s\n", $$1, $$2}'
@@ -74,3 +78,20 @@ langfuse-test: ## Send one test trace from the app namespace with the Python SDK
 	$(KUBECTL) -n app wait --for=condition=Complete job/langfuse-smoke-test --timeout=5m || \
 		($(KUBECTL) -n app logs job/langfuse-smoke-test; exit 1)
 	$(KUBECTL) -n app logs job/langfuse-smoke-test
+
+qdrant-up: ## Install or upgrade Qdrant and wait until it is Ready
+	$(HELM) repo add qdrant https://qdrant.github.io/qdrant-helm --force-update
+	$(HELM) upgrade --install qdrant qdrant/qdrant --version $(QDRANT_CHART_VERSION) \
+		--namespace qdrant -f deploy/qdrant/values.yaml --wait --timeout 5m
+
+qdrant-down: ## Uninstall Qdrant (keeps the PVC, so collections survive a reinstall)
+	-$(HELM) uninstall qdrant --namespace qdrant --wait
+
+qdrant-purge: qdrant-down ## Uninstall Qdrant and delete its data (PVC)
+	$(KUBECTL) -n qdrant delete pvc --all
+
+qdrant-status: ## Show Qdrant pods, services and PVCs
+	@$(KUBECTL) -n qdrant get pods,svc,pvc
+
+qdrant-ui: ## Port-forward Qdrant to http://localhost:6333/dashboard
+	$(KUBECTL) -n qdrant port-forward svc/qdrant 6333:6333

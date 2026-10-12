@@ -1,0 +1,31 @@
+# Qdrant Helm values for the obs-lab kind cluster.
+# Chart: qdrant/qdrant (https://github.com/qdrant/qdrant-helm), version pinned in the Makefile.
+#
+# Single node, persistent storage, laptop-sized resources. See docs/vector-store.md.
+
+replicaCount: 1
+
+image:
+  pullPolicy: IfNotPresent
+
+# Single node: no need for the Raft consensus / p2p cluster mode the chart enables by default.
+config:
+  cluster:
+    enabled: false
+  telemetry_disabled: true
+
+# The chart always creates a PVC (StatefulSet volumeClaimTemplate) mounted at /qdrant/storage.
+# kind's local-path provisioner doesn't enforce the size.
+persistence:
+  accessModes: ["ReadWriteOnce"]
+  size: 5Gi
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    memory: 1Gi
+
+# No API key: Qdrant is only reachable inside the cluster or through kubectl port-forward.
+# apiKey: false
