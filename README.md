@@ -34,4 +34,13 @@ make cluster-status  # nodes, namespaces, pods
 make cluster-down    # delete the cluster
 ```
 
-See [docs/cluster.md](docs/cluster.md) for details.
+Then Langfuse:
+
+```sh
+make langfuse-up     # cert-manager, ClickHouse operator, secrets, Langfuse
+make langfuse-ui     # http://localhost:3000 (login in secrets/langfuse.env)
+make langfuse-test   # send a test trace
+make langfuse-down   # uninstall (keeps data)
+```
+
+See [docs/cluster.md](docs/cluster.md) and [docs/langfuse.md](docs/langfuse.md) for details.
