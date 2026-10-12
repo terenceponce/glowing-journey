@@ -1,0 +1,27 @@
+# One-shot Job that chunks the corpus baked into the ingest image, embeds it via the
+# embedder service and upserts it into the Qdrant collection.
+# Settings come from the `ingest-config` ConfigMap (created by `make ingest` from Makefile variables).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ingest
+  namespace: app
+spec:
+  backoffLimit: 1
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: ingest
+          image: ingest:0.1.0
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: ingest-config
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi

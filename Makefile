@@ -14,12 +14,26 @@ QDRANT_CHART_VERSION ?= 1.19.2
 
 # Locally built images, loaded into kind (no registry). Bump the tag when the code changes.
 PLATFORM       ?= linux/arm64
-EMBEDDER_IMAGE ?= embedder:0.1.0
+EMBEDDER_IMAGE ?= embedder:0.1.1
+INGEST_IMAGE   ?= ingest:0.1.0
+
+# Corpus baked into the ingest image: a pinned commit of kubernetes/website.
+CORPUS_REPO ?= https://github.com/kubernetes/website.git
+CORPUS_REF  ?= cb2e97a15992f47dba976a47ccca071e4d167464
+CORPUS_PATH ?= content/en/docs/concepts
+
+# Ingestion settings (override like `make ingest CHUNK_SIZE=800 CHUNK_OVERLAP=100`).
+COLLECTION    ?= docs
+CHUNK_SIZE    ?= 1200
+CHUNK_OVERLAP ?= 200
+EMBEDDER_URL  ?= http://embedder.app.svc.cluster.local:8000
+QDRANT_URL    ?= http://qdrant.qdrant.svc.cluster.local:6333
 
 .PHONY: help cluster-up cluster-down cluster-status \
 	langfuse-prereqs langfuse-secrets langfuse-up langfuse-down langfuse-purge langfuse-status langfuse-ui langfuse-test \
 	qdrant-up qdrant-down qdrant-purge qdrant-status qdrant-ui \
-	embedder-image embedder-up embedder-down embedder-test
+	embedder-image embedder-up embedder-down embedder-test \
+	ingest-image ingest query
 
 help: ## List targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-16s %s\n", $$1, $$2}'
@@ -120,3 +134,31 @@ embedder-test: ## Call /healthz and /embed from inside the cluster
 		print(u.urlopen(b + '/healthz').read().decode()); \
 		r = u.Request(b + '/embed', json.dumps({'texts': ['hello world']}).encode(), {'content-type': 'application/json'}); \
 		d = json.load(u.urlopen(r)); print('dim', d['dim'], 'first values', d['vectors'][0][:4])"
+
+ingest-image: ## Build the ingest image (corpus pinned to CORPUS_REF baked in) and load it into kind
+	docker build --platform $(PLATFORM) -t $(INGEST_IMAGE) \
+		--build-arg CORPUS_REPO=$(CORPUS_REPO) --build-arg CORPUS_REF=$(CORPUS_REF) \
+		--build-arg CORPUS_PATH=$(CORPUS_PATH) services/ingest
+	kind load docker-image $(INGEST_IMAGE) --name $(CLUSTER_NAME)
+
+ingest: ingest-image ## Run the ingestion Job (recreates the Qdrant collection) and print its logs
+	$(KUBECTL) -n app create configmap ingest-config \
+		--from-literal=EMBEDDER_URL=$(EMBEDDER_URL) --from-literal=QDRANT_URL=$(QDRANT_URL) \
+		--from-literal=COLLECTION=$(COLLECTION) --from-literal=CHUNK_SIZE=$(CHUNK_SIZE) \
+		--from-literal=CHUNK_OVERLAP=$(CHUNK_OVERLAP) --from-literal=RECREATE_COLLECTION=true \
+		--dry-run=client -o yaml | $(KUBECTL) apply -f -
+	$(KUBECTL) -n app delete job ingest --ignore-not-found
+	sed 's|image: ingest:.*|image: $(INGEST_IMAGE)|' deploy/ingest/ingest-job.yaml | $(KUBECTL) apply -f -
+	@# Poll instead of `kubectl wait --for=condition=Complete`, which hangs until timeout if the Job fails.
+	@for i in $$(seq 1 240); do \
+		s=$$($(KUBECTL) -n app get job ingest -o jsonpath='{.status.conditions[?(@.status=="True")].type}'); \
+		case "$$s" in *Complete*) break;; *Failed*) $(KUBECTL) -n app logs job/ingest --tail=30; exit 1;; esac; \
+		sleep 5; \
+	done
+	$(KUBECTL) -n app logs job/ingest
+
+Q ?= How do containers in the same Pod share storage?
+query: ## Embed Q via the embedder and print the top-5 chunks from Qdrant (make query Q="...")
+	$(KUBECTL) -n app run ingest-query --rm -i --restart=Never --quiet --image=$(INGEST_IMAGE) \
+		--env=EMBEDDER_URL=$(EMBEDDER_URL) --env=QDRANT_URL=$(QDRANT_URL) --env=COLLECTION=$(COLLECTION) \
+		-- python query.py "$(Q)"
