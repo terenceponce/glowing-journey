@@ -43,4 +43,14 @@ make langfuse-test   # send a test trace
 make langfuse-down   # uninstall (keeps data)
 ```
 
-See [docs/cluster.md](docs/cluster.md) and [docs/langfuse.md](docs/langfuse.md) for details.
+Then the vector store:
+
+```sh
+make qdrant-up       # Qdrant (persistent) in the qdrant namespace
+make embedder-up     # embedding service in the app namespace
+make ingest          # chunk + embed the Kubernetes concepts docs into the `docs` collection
+make query Q="How do containers in the same Pod share storage?"
+make qdrant-ui       # http://localhost:6333/dashboard
+```
+
+See [docs/cluster.md](docs/cluster.md), [docs/langfuse.md](docs/langfuse.md) and [docs/vector-store.md](docs/vector-store.md) for details.
