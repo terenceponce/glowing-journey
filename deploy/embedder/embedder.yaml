@@ -20,7 +20,7 @@ spec:
     spec:
       containers:
         - name: embedder
-          image: embedder:0.1.0
+          image: embedder:0.1.1
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
@@ -30,6 +30,9 @@ spec:
               value: "2"
             - name: MAX_BATCH
               value: "256"
+            # Texts per ONNX call. The fastembed default (256) OOMs at the 1Gi limit with long chunks.
+            - name: ONNX_BATCH_SIZE
+              value: "16"
             # BGE's recommended instruction for short retrieval queries; applied when kind=query.
             - name: QUERY_PREFIX
               value: "Represent this sentence for searching relevant passages: "
