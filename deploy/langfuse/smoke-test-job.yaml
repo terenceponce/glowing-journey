@@ -1,0 +1,39 @@
+# One-shot Job that sends a test trace to Langfuse from the `app` namespace,
+# using the same Secret (`langfuse-api`) the chatbot will use.
+# The script comes from the `langfuse-smoke-test` ConfigMap (created by `make langfuse-test`).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: langfuse-smoke-test
+  namespace: app
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 600
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: smoke-test
+          image: python:3.12-slim
+          command: ["sh", "-c"]
+          args:
+            - pip install --quiet --no-cache-dir --root-user-action=ignore "langfuse==4.17.0" && python /scripts/langfuse_smoke_test.py
+          env:
+            - name: LANGFUSE_BASE_URL
+              value: http://langfuse-web.langfuse.svc.cluster.local:3000
+          envFrom:
+            - secretRef:
+                name: langfuse-api
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+      volumes:
+        - name: scripts
+          configMap:
+            name: langfuse-smoke-test
