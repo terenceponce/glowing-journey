@@ -2,8 +2,15 @@ CLUSTER_NAME ?= obs-lab
 KIND_CONFIG  ?= cluster/kind-config.yaml
 KUBE_CONTEXT := kind-$(CLUSTER_NAME)
 KUBECTL      := kubectl --context $(KUBE_CONTEXT)
+HELM         := helm --kube-context $(KUBE_CONTEXT)
 
-.PHONY: help cluster-up cluster-down cluster-status
+# Versions from the langfuse-k8s README (chart v2 prerequisites).
+LANGFUSE_CHART_VERSION      ?= 2.1.4
+CERT_MANAGER_VERSION        ?= v1.20.2
+CLICKHOUSE_OPERATOR_VERSION ?= 0.0.8
+
+.PHONY: help cluster-up cluster-down cluster-status \
+	langfuse-prereqs langfuse-secrets langfuse-up langfuse-down langfuse-purge langfuse-status langfuse-ui langfuse-test
 
 help: ## List targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-16s %s\n", $$1, $$2}'
@@ -25,3 +32,45 @@ cluster-status: ## Show nodes, namespaces and pods
 	@$(KUBECTL) get nodes -o wide
 	@$(KUBECTL) get namespaces
 	@$(KUBECTL) get pods -A
+
+langfuse-prereqs: ## Install cert-manager and the ClickHouse operator (once per cluster)
+	$(HELM) upgrade --install cert-manager oci://quay.io/jetstack/charts/cert-manager \
+		--version $(CERT_MANAGER_VERSION) --namespace cert-manager --create-namespace \
+		--set crds.enabled=true --wait
+	$(KUBECTL) wait --for=condition=Established crd/certificates.cert-manager.io crd/issuers.cert-manager.io --timeout=120s
+	$(HELM) upgrade --install clickhouse-operator oci://ghcr.io/clickhouse/clickhouse-operator-helm \
+		--version $(CLICKHOUSE_OPERATOR_VERSION) --namespace clickhouse-operator --create-namespace --wait
+	$(KUBECTL) wait --for=condition=Established crd/clickhouseclusters.clickhouse.com crd/keeperclusters.clickhouse.com --timeout=120s
+
+langfuse-secrets: ## Generate secrets/langfuse.env (if missing) and apply the Langfuse Secrets
+	KUBECTL="$(KUBECTL)" scripts/langfuse-secrets.sh
+
+langfuse-up: langfuse-prereqs langfuse-secrets ## Install or upgrade Langfuse and wait until it is Ready
+	$(HELM) repo add langfuse https://langfuse.github.io/langfuse-k8s --force-update
+	$(HELM) upgrade --install langfuse langfuse/langfuse --version $(LANGFUSE_CHART_VERSION) \
+		--namespace langfuse -f deploy/langfuse/values.yaml --wait --timeout 15m
+	$(KUBECTL) -n langfuse rollout status deploy/langfuse-web --timeout=10m
+	$(KUBECTL) -n langfuse rollout status deploy/langfuse-worker --timeout=10m
+
+langfuse-down: ## Uninstall Langfuse (keeps PVCs and Secrets, so data survives a reinstall)
+	-$(HELM) uninstall langfuse --namespace langfuse --wait
+
+langfuse-purge: langfuse-down ## Uninstall Langfuse and delete its data (PVCs) and Secrets
+	$(KUBECTL) -n langfuse delete pvc --all
+	$(KUBECTL) -n langfuse delete secret langfuse langfuse-init --ignore-not-found
+	$(KUBECTL) -n app delete secret langfuse-api --ignore-not-found
+
+langfuse-status: ## Show Langfuse pods, services and PVCs
+	@$(KUBECTL) -n langfuse get pods,svc,pvc
+
+langfuse-ui: ## Port-forward the Langfuse UI to http://localhost:3000
+	$(KUBECTL) -n langfuse port-forward svc/langfuse-web 3000:3000
+
+langfuse-test: ## Send one test trace from the app namespace with the Python SDK
+	$(KUBECTL) -n app create configmap langfuse-smoke-test --from-file=scripts/langfuse_smoke_test.py \
+		--dry-run=client -o yaml | $(KUBECTL) apply -f -
+	$(KUBECTL) -n app delete job langfuse-smoke-test --ignore-not-found
+	$(KUBECTL) apply -f deploy/langfuse/smoke-test-job.yaml
+	$(KUBECTL) -n app wait --for=condition=Complete job/langfuse-smoke-test --timeout=5m || \
+		($(KUBECTL) -n app logs job/langfuse-smoke-test; exit 1)
+	$(KUBECTL) -n app logs job/langfuse-smoke-test

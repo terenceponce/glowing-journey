@@ -1,0 +1,137 @@
+# Langfuse Helm values for the obs-lab kind cluster.
+# Chart: langfuse/langfuse (https://github.com/langfuse/langfuse-k8s), version pinned in the Makefile.
+#
+# All credentials come from Kubernetes Secrets created by scripts/langfuse-secrets.sh
+# from the git-ignored secrets/langfuse.env:
+#   - `langfuse`       app secrets + datastore passwords (layout follows examples/minimal-installation)
+#   - `langfuse-init`  LANGFUSE_INIT_* headless-init vars (org, project, API keys, first user)
+#
+# Resources are trimmed for a laptop (Docker Desktop ~12 GB); see docs/langfuse.md.
+
+langfuse:
+  salt:
+    secretKeyRef:
+      name: langfuse
+      key: salt
+  encryptionKey:
+    secretKeyRef:
+      name: langfuse
+      key: encryption-key
+  nextauth:
+    url: http://localhost:3000
+    secret:
+      secretKeyRef:
+        name: langfuse
+        key: nextauth-secret
+
+  features:
+    # The first user is created by headless init, so public sign-up isn't needed.
+    signUpDisabled: true
+    telemetryEnabled: false
+
+  image:
+    pullPolicy: IfNotPresent
+
+  web:
+    pod:
+      # Headless initialization: creates the org, project, API keys and first user on startup.
+      additionalEnvFrom:
+        - secretRef:
+            name: langfuse-init
+    resources:
+      requests:
+        cpu: 250m
+        memory: 768Mi
+      limits:
+        memory: 1536Mi
+
+  worker:
+    resources:
+      requests:
+        cpu: 250m
+        memory: 512Mi
+      limits:
+        memory: 1Gi
+
+postgresql:
+  auth:
+    existingSecret: langfuse
+    secretKeys:
+      adminPasswordKey: postgresql-password
+      userPasswordKey: postgresql-password
+  settings:
+    existingSecret: langfuse
+  userDatabase:
+    existingSecret: langfuse
+  storage:
+    requestedSize: 5Gi
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 512Mi
+
+clickhouse:
+  auth:
+    existingSecret: langfuse
+    existingSecretKey: clickhouse-password
+  cluster:
+    replicas: 1
+    storage:
+      size: 10Gi
+    logger:
+      level: information
+    resources:
+      requests:
+        cpu: 250m
+        memory: 1Gi
+      limits:
+        memory: 2Gi
+  keeper:
+    # Chart default is 3 (HA). One is enough for a single-node lab.
+    replicas: 1
+    storage:
+      size: 1Gi
+    logger:
+      level: information
+    resources:
+      requests:
+        cpu: 50m
+        memory: 128Mi
+      limits:
+        memory: 512Mi
+
+redis:
+  auth:
+    existingSecret: langfuse
+    existingSecretPasswordKey: redis-password
+    # Valkey ACL Secret: key name == username (`default`)
+    usersExistingSecret: langfuse
+  dataStorage:
+    requestedSize: 1Gi
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 256Mi
+
+s3:
+  auth:
+    existingSecret: langfuse
+    rootUserSecretKey: s3-user
+    rootPasswordSecretKey: s3-password
+  allInOne:
+    s3:
+      # SeaweedFS IAM config JSON lives under key `seaweedfs_s3_config`
+      existingConfigSecret: langfuse
+    data:
+      size: 10Gi
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 1
+        memory: 512Mi
