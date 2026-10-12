@@ -1,0 +1,68 @@
+# Embedding service (services/embedder) in the `app` namespace.
+# The image is built locally and loaded with `kind load docker-image` (make embedder-up).
+# In-cluster URL: http://embedder.app.svc.cluster.local:8000
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: embedder
+  namespace: app
+  labels:
+    app.kubernetes.io/name: embedder
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: embedder
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: embedder
+    spec:
+      containers:
+        - name: embedder
+          image: embedder:0.1.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            - name: EMBED_THREADS
+              value: "2"
+            - name: MAX_BATCH
+              value: "256"
+            # BGE's recommended instruction for short retrieval queries; applied when kind=query.
+            - name: QUERY_PREFIX
+              value: "Represent this sentence for searching relevant passages: "
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "2"
+              memory: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: embedder
+  namespace: app
+  labels:
+    app.kubernetes.io/name: embedder
+spec:
+  selector:
+    app.kubernetes.io/name: embedder
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http

@@ -12,9 +12,14 @@ CLICKHOUSE_OPERATOR_VERSION ?= 0.0.8
 # Qdrant chart (https://github.com/qdrant/qdrant-helm); app version matches the chart version.
 QDRANT_CHART_VERSION ?= 1.19.2
 
+# Locally built images, loaded into kind (no registry). Bump the tag when the code changes.
+PLATFORM       ?= linux/arm64
+EMBEDDER_IMAGE ?= embedder:0.1.0
+
 .PHONY: help cluster-up cluster-down cluster-status \
 	langfuse-prereqs langfuse-secrets langfuse-up langfuse-down langfuse-purge langfuse-status langfuse-ui langfuse-test \
-	qdrant-up qdrant-down qdrant-purge qdrant-status qdrant-ui
+	qdrant-up qdrant-down qdrant-purge qdrant-status qdrant-ui \
+	embedder-image embedder-up embedder-down embedder-test
 
 help: ## List targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-16s %s\n", $$1, $$2}'
@@ -95,3 +100,23 @@ qdrant-status: ## Show Qdrant pods, services and PVCs
 
 qdrant-ui: ## Port-forward Qdrant to http://localhost:6333/dashboard
 	$(KUBECTL) -n qdrant port-forward svc/qdrant 6333:6333
+
+embedder-image: ## Build the embedding service image (model baked in) and load it into kind
+	docker build --platform $(PLATFORM) -t $(EMBEDDER_IMAGE) services/embedder
+	kind load docker-image $(EMBEDDER_IMAGE) --name $(CLUSTER_NAME)
+
+embedder-up: embedder-image ## Deploy the embedding service to the app namespace and wait until Ready
+	$(KUBECTL) apply -f deploy/embedder/embedder.yaml
+	$(KUBECTL) -n app set image deploy/embedder embedder=$(EMBEDDER_IMAGE)
+	$(KUBECTL) -n app rollout restart deploy/embedder
+	$(KUBECTL) -n app rollout status deploy/embedder --timeout=5m
+
+embedder-down: ## Remove the embedding service
+	$(KUBECTL) delete -f deploy/embedder/embedder.yaml --ignore-not-found
+
+embedder-test: ## Call /healthz and /embed from inside the cluster
+	$(KUBECTL) -n app run embedder-test --rm -i --restart=Never --quiet --image=$(EMBEDDER_IMAGE) -- \
+		python -c "import json, urllib.request as u; b='http://embedder:8000'; \
+		print(u.urlopen(b + '/healthz').read().decode()); \
+		r = u.Request(b + '/embed', json.dumps({'texts': ['hello world']}).encode(), {'content-type': 'application/json'}); \
+		d = json.load(u.urlopen(r)); print('dim', d['dim'], 'first values', d['vectors'][0][:4])"
