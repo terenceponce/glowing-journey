@@ -119,6 +119,8 @@ Each read returned exactly one score with the first vote's timestamp. A read-onl
 
 In the Langfuse UI, the score belongs to the trace (Tracing → the trace). Per the Langfuse docs, the traces table can be filtered by `user-feedback < 1` to find disliked answers. The chat page's own requests (`POST /chat`, then `POST /feedback` with `source: chat-page`) were also replayed with curl through `make chatbot-ui`, with the same results.
 
+**Click test in the browser** (`make chatbot-ui`, Chrome): asked "What is a Service in Kubernetes?" and clicked 👍. The page showed 👍 selected and "Thanks!", and `/api/public/v3/scores` had `user-feedback=1` on trace `71cbbadd…` (`metadata.source: chat-page`). Then clicked 👎 and sent the comment "No example of a Service manifest". That is three `POST /feedback` calls (up; down; down + comment, per the chatbot log). Afterwards the API, and ClickHouse with `FINAL`, showed one score: value `0`, that comment, and the timestamp of the first click.
+
 ## Prompt management
 
 - The prompt is the chat prompt **`rag-chat`** with two messages. The `system` message holds the rules, and the `user` message has `{{context}}` and `{{question}}`. History is inserted between them. Source: `services/chatbot/prompts.py`.
