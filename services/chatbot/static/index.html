@@ -27,9 +27,13 @@
   ol.sources li { margin-bottom: 6px; }
   ol.sources code { font-size: 12px; }
   .snippet { color: var(--muted); }
-  /* Placeholder for thumbs up/down feedback buttons (next task). */
-  .feedback { margin-top: 6px; display: flex; gap: 6px; }
-  .feedback:empty { display: none; }
+  .feedback { margin-top: 8px; display: flex; gap: 6px; align-items: center; flex-wrap: wrap; white-space: normal; font-size: 13px; }
+  .feedback button { border: 1px solid var(--line); background: var(--bg); color: var(--fg); border-radius: 6px; padding: 2px 8px; cursor: pointer; font: inherit; }
+  .feedback button.on { border-color: var(--accent); background: var(--user); }
+  .feedback button:disabled { opacity: .5; cursor: default; }
+  .feedback input { flex: 1; min-width: 160px; padding: 3px 8px; border-radius: 6px; border: 1px solid var(--line); background: var(--card); color: var(--fg); font: inherit; }
+  .feedback .status { color: var(--muted); }
+  .feedback .status.error { color: #d92d20; }
   form { display: flex; gap: 8px; position: sticky; bottom: 0; background: var(--bg); padding: 8px 0 4px; }
   textarea { flex: 1; resize: vertical; min-height: 44px; padding: 10px; border-radius: 8px; border: 1px solid var(--line); background: var(--card); color: var(--fg); font: inherit; }
   form button { padding: 0 18px; border: 0; border-radius: 8px; background: var(--accent); color: #fff; font: inherit; cursor: pointer; }
@@ -93,9 +97,50 @@
       }
       el.appendChild(d);
     }
+    if (data.trace_id) el.appendChild(feedbackBar(data.trace_id));
+  }
+
+  // Thumbs up/down + optional comment, recorded as the Langfuse score `user-feedback` on the turn's trace.
+  // Voting again (or adding a comment) updates the same score.
+  function feedbackBar(traceId) {
     const fb = document.createElement("div");
-    fb.className = "feedback"; // thumbs up/down go here later
-    el.appendChild(fb);
+    fb.className = "feedback";
+    fb.innerHTML = `<button type="button" data-value="1" title="Good answer" aria-label="Thumbs up">👍</button>
+      <button type="button" data-value="0" title="Bad answer" aria-label="Thumbs down">👎</button>
+      <input type="text" maxlength="1000" placeholder="Optional comment" hidden>
+      <button type="button" class="comment" hidden>Send comment</button>
+      <span class="status"></span>`;
+    const [up, down] = fb.querySelectorAll("button[data-value]");
+    const input = fb.querySelector("input"), sendComment = fb.querySelector("button.comment"), status = fb.querySelector(".status");
+    let value = null;
+
+    async function send() {
+      fb.querySelectorAll("button").forEach((b) => (b.disabled = true));
+      status.className = "status";
+      status.textContent = "Saving…";
+      try {
+        const r = await fetch("/feedback", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ trace_id: traceId, value, comment: input.value.trim() || null, user_id: userId }),
+        });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        up.classList.toggle("on", value === 1);
+        down.classList.toggle("on", value === 0);
+        input.hidden = sendComment.hidden = false;
+        status.textContent = "Thanks!";
+      } catch (err) {
+        status.className = "status error";
+        status.textContent = "Feedback not saved: " + err.message;
+      } finally {
+        fb.querySelectorAll("button").forEach((b) => (b.disabled = false));
+      }
+    }
+
+    for (const b of [up, down]) b.addEventListener("click", () => { value = Number(b.dataset.value); send(); });
+    sendComment.addEventListener("click", send);
+    input.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); send(); } });
+    return fb;
   }
 
   $("form").addEventListener("submit", async (e) => {

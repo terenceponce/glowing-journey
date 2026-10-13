@@ -1,8 +1,12 @@
 """Print a Langfuse trace as a tree: observation type, name, latency, model, tokens, cost and prompt version.
 
-Usage (inside the chatbot pod, which has the Langfuse keys): python show_trace.py <trace-id>
-Run it with `make chatbot-trace TRACE=<trace-id>`. Langfuse v4 has no /api/public/traces, so this reads
-/api/public/v2/observations?traceId=... .
+Usage (inside the chatbot pod, which has the Langfuse keys):
+  python show_trace.py <trace-id>                    observation tree, then the trace's scores
+  python show_trace.py --scores <trace-id> [VALUE [COMMENT]]
+      only the scores; with VALUE (and COMMENT), wait until user-feedback has them
+Run it with `make chatbot-trace TRACE=<trace-id>` (or `make chatbot-feedback`). Langfuse v4 has no
+/api/public/traces or /api/public/scores, so this reads /api/public/v2/observations?traceId=... and
+/api/public/v3/scores?traceId=... .
 """
 
 import json
@@ -14,9 +18,13 @@ from datetime import datetime
 import httpx
 
 
-def fetch(trace_id: str) -> list[dict]:
+def client() -> httpx.Client:
     auth = (os.environ["LANGFUSE_PUBLIC_KEY"], os.environ["LANGFUSE_SECRET_KEY"])
-    with httpx.Client(base_url=os.environ["LANGFUSE_BASE_URL"], auth=auth, timeout=30) as api:
+    return httpx.Client(base_url=os.environ["LANGFUSE_BASE_URL"], auth=auth, timeout=30)
+
+
+def fetch(trace_id: str) -> list[dict]:
+    with client() as api:
         # Ingestion is asynchronous: give it a few seconds, until the observation count stops growing.
         observations: list[dict] = []
         for _ in range(10):
@@ -31,6 +39,39 @@ def fetch(trace_id: str) -> list[dict]:
             observations = data
             time.sleep(2)
         return observations
+
+
+def fetch_scores(trace_id: str, expect: float | None = None, comment: str | None = None) -> list[dict]:
+    """The trace's scores. With `expect`, poll (ingestion is asynchronous) until user-feedback has that value
+    and comment."""
+    wanted = lambda s: s["name"] == "user-feedback" and s.get("value") == expect and (s.get("comment") or None) == comment  # noqa: E731
+    with client() as api:
+        for _ in range(15 if expect is not None else 1):
+            # Core fields only by default; `details` adds comment and metadata, `subject` what the score is on.
+            resp = api.get("/api/public/v3/scores", params={"traceId": trace_id, "limit": 100, "fields": "details,subject"})
+            resp.raise_for_status()
+            scores = resp.json()["data"]
+            if expect is None or any(wanted(s) for s in scores):
+                return scores
+            time.sleep(2)
+        sys.exit(f"user-feedback={expect:g} not visible on trace {trace_id} after 30 s; got {[describe_score(s) for s in scores]}")
+
+
+def describe_score(s: dict) -> str:
+    subject = s.get("subject") or {}
+    parts = [f"{s['name']}={s['value']}", s["dataType"], f"on {subject.get('kind', '?')}", f"id={s['id']}"]
+    if s.get("comment"):
+        parts.append(f"comment={json.dumps(s['comment'])}")
+    if s.get("metadata"):
+        parts.append(f"metadata={json.dumps(s['metadata'], separators=(',', ':'))}")
+    parts.append(f"source={s.get('source')}  timestamp={s.get('timestamp')}")
+    return "  ".join(p for p in parts if p)
+
+
+def print_scores(scores: list[dict]) -> None:
+    print(f"  scores ({len(scores)}):")
+    for s in scores:
+        print("  - " + describe_score(s))
 
 
 def seconds(o: dict) -> float | None:
@@ -64,6 +105,13 @@ def describe(o: dict) -> str:
 
 
 def main() -> None:
+    if sys.argv[1] == "--scores":
+        trace_id = sys.argv[2]
+        expect = float(sys.argv[3]) if len(sys.argv) > 3 else None
+        comment = sys.argv[4] if len(sys.argv) > 4 and sys.argv[4] else None
+        print(f"trace {trace_id}")
+        print_scores(fetch_scores(trace_id, expect, comment))
+        return
     trace_id = sys.argv[1]
     observations = fetch(trace_id)
     if not observations:
@@ -90,6 +138,7 @@ def main() -> None:
             walk(o["id"], depth + 1)
 
     walk(None, 1)
+    print_scores(fetch_scores(trace_id))
     print(f"Open: http://localhost:3000/project/rag-chatbot/traces/{trace_id}")
 
 

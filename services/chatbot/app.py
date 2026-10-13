@@ -7,6 +7,9 @@ Retrieval and generation live in rag.py (see its docstring for config). Here:
 Every POST /chat is one Langfuse trace (docs/observability.md): a root `chat` span carrying user_id, session_id
 and tags, with embed-query, retrieve and generate inside it. Tracing is asynchronous and best-effort: if Langfuse
 is down, the chat still works and the SDK drops what it can't send. Spans are flushed on shutdown.
+
+POST /feedback records a thumbs up/down on a turn as the Langfuse score `user-feedback` (1 = up, 0 = down) on its
+trace. The score ID is derived from the trace ID, so a changed vote overwrites the score instead of adding one.
 """
 
 import logging
@@ -16,8 +19,10 @@ import time
 import uuid
 from collections import OrderedDict
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from importlib.metadata import version
 from pathlib import Path
+from typing import Literal
 
 import httpx
 import openai
@@ -33,6 +38,7 @@ MAX_SESSIONS = int(os.environ.get("MAX_SESSIONS", "1000"))
 STATIC_DIR = Path(__file__).parent / "static"
 APP_VERSION = version("chatbot")
 ENVIRONMENT = os.environ.get("LANGFUSE_TRACING_ENVIRONMENT", "default")
+FEEDBACK_SCORE = "user-feedback"
 TRACE_TAGS = [f"env:{ENVIRONMENT}", f"version:{APP_VERSION}", f"model:{rag.LLM_MODEL}"]
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -59,6 +65,12 @@ app = FastAPI(title="chatbot", lifespan=lifespan, telemetry={"tracing": False, "
 sessions: OrderedDict[str, list[dict]] = OrderedDict()
 sessions_lock = threading.Lock()
 
+# Langfuse public API (read side), for looking up existing feedback scores.
+langfuse_api = httpx.Client(
+    base_url=os.environ.get("LANGFUSE_BASE_URL", ""),
+    auth=(os.environ.get("LANGFUSE_PUBLIC_KEY", ""), os.environ.get("LANGFUSE_SECRET_KEY", "")),
+    timeout=5,
+)
 
 class ChatRequest(BaseModel):
     session_id: str = Field(min_length=1, max_length=128)
@@ -84,6 +96,22 @@ class ChatResponse(BaseModel):
     model: str
     sources: list[Source]
     usage: dict
+
+
+class FeedbackRequest(BaseModel):
+    trace_id: str = Field(pattern=r"^[0-9a-f]{32}$")  # from ChatResponse.trace_id
+    value: Literal[0, 1]  # 1 = thumbs up, 0 = thumbs down
+    comment: str | None = Field(default=None, max_length=1000)
+    user_id: str | None = Field(default=None, max_length=128)
+    source: str = Field(default="chat-page", max_length=64)  # where the vote came from, e.g. "make"
+
+
+class FeedbackResponse(BaseModel):
+    score_id: str
+    trace_id: str
+    name: str
+    value: int
+    comment: str | None
 
 
 def get_history(session_id: str) -> list[dict]:
@@ -171,3 +199,32 @@ def answer(req: ChatRequest, message_id: str, question: str, history: list[dict]
         ],
         usage=usage,
     )
+
+
+def existing_score_timestamp(score_id: str) -> datetime | None:
+    """Timestamp of an already ingested score, or None. Langfuse only overwrites a score when the ID, the name and
+    the timestamp's date all match, so a changed vote must reuse the first vote's timestamp."""
+    try:
+        resp = langfuse_api.get("/api/public/v3/scores", params={"id": score_id, "limit": 1})
+        resp.raise_for_status()
+        data = resp.json()["data"]
+    except (httpx.HTTPError, KeyError, ValueError) as exc:
+        log.warning("score lookup failed: %s", type(exc).__name__)
+        return None
+    return datetime.fromisoformat(data[0]["timestamp"].replace("Z", "+00:00")) if data else None
+
+
+@app.post("/feedback", response_model=FeedbackResponse)
+def feedback(req: FeedbackRequest) -> FeedbackResponse:
+    score_id = f"{FEEDBACK_SCORE}-{req.trace_id}"
+    comment = (req.comment or "").strip() or None
+    timestamp = existing_score_timestamp(score_id) or datetime.now(timezone.utc)
+    # Sent in the background like the spans; the SDK's score queue is flushed on shutdown too.
+    # The SDK leaves None fields out of the body and Langfuse then keeps the stored value, so removing a comment
+    # needs an explicit empty string.
+    rag.langfuse.create_score(
+        score_id=score_id, trace_id=req.trace_id, name=FEEDBACK_SCORE, value=req.value, data_type="NUMERIC",
+        comment=comment or "", timestamp=timestamp, metadata={"user_id": req.user_id, "source": req.source},
+    )
+    log.info("feedback trace=%s value=%d comment=%s", req.trace_id, req.value, comment is not None)
+    return FeedbackResponse(score_id=score_id, trace_id=req.trace_id, name=FEEDBACK_SCORE, value=req.value, comment=comment)

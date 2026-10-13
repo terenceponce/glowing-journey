@@ -16,7 +16,7 @@ QDRANT_CHART_VERSION ?= 1.19.2
 PLATFORM       ?= linux/arm64
 EMBEDDER_IMAGE ?= embedder:0.1.1
 INGEST_IMAGE   ?= ingest:0.1.0
-CHATBOT_IMAGE  ?= chatbot:0.2.0
+CHATBOT_IMAGE  ?= chatbot:0.3.0
 
 # Corpus baked into the ingest image: a pinned commit of kubernetes/website.
 CORPUS_REPO ?= https://github.com/kubernetes/website.git
@@ -51,7 +51,7 @@ LANGFUSE_PROMPT_LABEL ?= production
 	embedder-image embedder-up embedder-down embedder-test \
 	ingest-image ingest query \
 	chatbot-secret chatbot-image chatbot-config chatbot-langfuse-setup chatbot-up chatbot-down chatbot-status \
-	chatbot-logs chatbot-ui chatbot-test chatbot-trace
+	chatbot-logs chatbot-ui chatbot-test chatbot-trace chatbot-feedback
 
 help: ## List targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-16s %s\n", $$1, $$2}'
@@ -242,3 +242,15 @@ TRACE ?=
 chatbot-trace: ## Print a Langfuse trace as a tree (make chatbot-trace TRACE=<trace-id>, from chatbot-test or the UI)
 	@test -n "$(TRACE)" || (echo "usage: make chatbot-trace TRACE=<trace-id>"; exit 1)
 	$(KUBECTL) -n app exec deploy/chatbot -- python show_trace.py $(TRACE)
+
+VOTE    ?= up
+COMMENT ?=
+chatbot-feedback: ## Rate a turn like the chat page does (make chatbot-feedback TRACE=<id> VOTE=up|down COMMENT="...")
+	@test -n "$(TRACE)" || (echo "usage: make chatbot-feedback TRACE=<trace-id> VOTE=up|down [COMMENT=...]"; exit 1)
+	@case "$(VOTE)" in up|down) ;; *) echo "VOTE must be up or down"; exit 1;; esac
+	$(KUBECTL) -n app exec deploy/chatbot -- env TRACE="$(TRACE)" VALUE="$(if $(filter up,$(VOTE)),1,0)" COMMENT="$(COMMENT)" \
+		python -c "import json, os, urllib.request as u; \
+		r = u.Request('http://localhost:8000/feedback', json.dumps({'trace_id': os.environ['TRACE'], 'value': int(os.environ['VALUE']), \
+		'comment': os.environ['COMMENT'] or None, 'user_id': 'make-test', 'source': 'make'}).encode(), {'content-type': 'application/json'}); \
+		print(u.urlopen(r, timeout=30).read().decode())"
+	$(KUBECTL) -n app exec deploy/chatbot -- python show_trace.py --scores $(TRACE) $(if $(filter up,$(VOTE)),1,0) "$(COMMENT)"
