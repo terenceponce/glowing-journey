@@ -7,7 +7,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_ROOT_USER_ACTION=ignore
 
 WORKDIR /srv
-COPY pyproject.toml app.py rag.py ./
+COPY pyproject.toml *.py ./
 RUN pip install --quiet .
 COPY static ./static
 

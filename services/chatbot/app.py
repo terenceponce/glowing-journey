@@ -3,6 +3,10 @@
 Retrieval and generation live in rag.py (see its docstring for config). Here:
   MAX_HISTORY_TURNS  earlier question/answer pairs kept per session and sent to the LLM (default 6)
   MAX_SESSIONS       sessions kept in memory; the oldest is dropped beyond this (default 1000)
+
+Every POST /chat is one Langfuse trace (docs/observability.md): a root `chat` span carrying user_id, session_id
+and tags, with embed-query, retrieve and generate inside it. Tracing is asynchronous and best-effort: if Langfuse
+is down, the chat still works and the SDK drops what it can't send. Spans are flushed on shutdown.
 """
 
 import logging
@@ -11,12 +15,15 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
+from contextlib import asynccontextmanager
+from importlib.metadata import version
 from pathlib import Path
 
 import httpx
 import openai
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
+from langfuse import propagate_attributes
 from pydantic import BaseModel, Field
 
 import rag
@@ -24,11 +31,29 @@ import rag
 MAX_HISTORY_TURNS = int(os.environ.get("MAX_HISTORY_TURNS", "6"))
 MAX_SESSIONS = int(os.environ.get("MAX_SESSIONS", "1000"))
 STATIC_DIR = Path(__file__).parent / "static"
+APP_VERSION = version("chatbot")
+ENVIRONMENT = os.environ.get("LANGFUSE_TRACING_ENVIRONMENT", "default")
+TRACE_TAGS = [f"env:{ENVIRONMENT}", f"version:{APP_VERSION}", f"model:{rag.LLM_MODEL}"]
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("chatbot")
 
-app = FastAPI(title="chatbot")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Warm the prompt cache so the first chat doesn't wait for it (falls back to the built-in prompt if it can't).
+    prompt = rag.get_prompt("", [])
+    log.info("prompt %s version=%s (fallback=%s), app version %s", prompt.name, prompt.version, prompt.client is None, APP_VERSION)
+    yield
+    # Kubernetes sends SIGTERM; uvicorn runs this before exiting. Send any spans still queued.
+    log.info("flushing Langfuse")
+    rag.langfuse.shutdown()
+
+
+# FastAPI has built-in OpenTelemetry that uses the global tracer provider, which the Langfuse SDK sets up.
+# Its HTTP spans would become parents of `chat` but are filtered out on export, leaving `chat` with a
+# parent that doesn't exist in Langfuse. Turn it off so `chat` is the trace root.
+app = FastAPI(title="chatbot", lifespan=lifespan, telemetry={"tracing": False, "metrics": False, "logs": False})
 
 # In-memory history: session_id -> list of {"role", "content"} messages. Lost on restart; fine for a lab.
 sessions: OrderedDict[str, list[dict]] = OrderedDict()
@@ -53,6 +78,7 @@ class Source(BaseModel):
 
 class ChatResponse(BaseModel):
     message_id: str  # for attaching feedback (thumbs up/down) to this answer later
+    trace_id: str | None  # Langfuse trace of this turn
     session_id: str
     answer: str
     model: str
@@ -87,32 +113,54 @@ def healthz() -> dict:
 # Plain `def`: FastAPI runs it in a worker thread, so the blocking HTTP calls don't stall the event loop.
 @app.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest) -> ChatResponse:
-    started = time.monotonic()
+    message_id = str(uuid.uuid4())
     question = req.message.strip()
+    history = get_history(req.session_id)
+    with rag.langfuse.start_as_current_observation(
+        as_type="span", name="chat",
+        input={"message": question, "history_turns": len(history) // 2},
+        metadata={"message_id": message_id},
+    ) as root, propagate_attributes(
+        user_id=req.user_id, session_id=req.session_id, tags=TRACE_TAGS, version=APP_VERSION, trace_name="chat",
+    ):
+        try:
+            response = answer(req, message_id, question, history)
+        except HTTPException as exc:
+            root.update(level="ERROR", status_message=exc.detail)
+            raise
+        root.update(output={"answer": response.answer, "sources": [s.source for s in response.sources]})
+        response.trace_id = rag.langfuse.get_current_trace_id()
+        return response
+
+
+def answer(req: ChatRequest, message_id: str, question: str, history: list[dict]) -> ChatResponse:
+    started = time.monotonic()
     try:
         chunks = rag.retrieve(question)
     except Exception as exc:  # embedder or Qdrant down
         log.exception("retrieval failed")
         raise HTTPException(status_code=502, detail=f"retrieval failed: {type(exc).__name__}") from exc
 
-    messages = rag.build_messages(question, get_history(req.session_id), chunks)
+    prompt = rag.get_prompt(question, chunks)
+    messages = rag.build_messages(prompt, history)
     try:
-        answer, usage = rag.generate(messages)
+        text, usage = rag.generate(messages, prompt)
     except (openai.APIError, httpx.HTTPError) as exc:
         # Log the type and status only: SDK errors carry the response body, never the API key.
         status = getattr(exc, "status_code", None)
         log.error("LLM call failed: %s status=%s", type(exc).__name__, status)
         raise HTTPException(status_code=502, detail=f"LLM call failed: {type(exc).__name__} {status or ''}".strip()) from exc
 
-    save_turn(req.session_id, question, answer)
+    save_turn(req.session_id, question, text)
     log.info(
-        "chat session=%s chunks=%d tokens=%s latency=%.2fs",
-        req.session_id, len(chunks), usage.get("total_tokens"), time.monotonic() - started,
+        "chat session=%s chunks=%d tokens=%s prompt=%s@%s latency=%.2fs",
+        req.session_id, len(chunks), usage.get("total_tokens"), prompt.name, prompt.version, time.monotonic() - started,
     )
     return ChatResponse(
-        message_id=str(uuid.uuid4()),
+        message_id=message_id,
+        trace_id=None,
         session_id=req.session_id,
-        answer=answer,
+        answer=text,
         model=rag.LLM_MODEL,
         sources=[
             Source(
