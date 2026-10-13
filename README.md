@@ -23,6 +23,11 @@ Work is tracked in [GitHub Issues](https://github.com/terenceponce/glowing-journ
 4. RAG chatbot (#4)
 5. Instrument the chatbot with Langfuse (#5)
 6. Evals and failure drills (#6)
+   1. User feedback scores (#7)
+   2. LLM-as-judge evaluations (#8)
+   3. Dataset and experiments (#9)
+   4. Failure drills (#10)
+   5. Langfuse dashboards (#11)
 
 ## Getting started
 
