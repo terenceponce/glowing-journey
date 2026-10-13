@@ -1,6 +1,6 @@
 # RAG chatbot
 
-A FastAPI app in the `app` namespace. It answers questions about Kubernetes from the Qdrant `docs` collection (see [vector-store.md](vector-store.md)) using Z.AI's GLM through the `openai` SDK.
+A FastAPI app in the `app` namespace. It answers questions about Kubernetes from the Qdrant `docs` collection (see [vector-store.md](vector-store.md)) using Z.AI's GLM through the `openai` SDK. Every turn is traced in Langfuse; see [observability.md](observability.md).
 
 ```
 browser ──port-forward :8080──▶ chatbot (app ns, :8000)
@@ -19,8 +19,9 @@ umask 077; printf 'ZAI_API_KEY=%s\n' '<your key>' > secrets/zai.env
 ```
 
 ```sh
-make chatbot-up       # zai-api Secret + build image (arm64) + kind load + chatbot-config + deploy, waits until Ready
-make chatbot-test     # one question through POST /chat from inside the cluster (make chatbot-test Q="...")
+make chatbot-up       # zai-api Secret + build image (arm64) + kind load + chatbot-config + Langfuse setup + deploy, waits until Ready
+make chatbot-test     # one question through POST /chat from inside the cluster (make chatbot-test Q="..." SESSION=...)
+make chatbot-trace    # print a turn's Langfuse trace (make chatbot-trace TRACE=<trace_id>)
 make chatbot-ui       # chat page at http://localhost:8080 (Ctrl-C to stop)
 make chatbot-logs     # follow logs
 make chatbot-status   # pod, service and the current chatbot-config
@@ -31,7 +32,10 @@ make chatbot-down     # remove Deployment + Service (keeps Secret and ConfigMap)
 
 | File | What |
 |---|---|
-| `rag.py` | `retrieve(question)` embeds the question with `kind: "query"` and returns the top-k `Chunk`s from Qdrant. `build_messages(...)` builds the system prompt, history and numbered context. `generate(messages)` calls the LLM and returns the answer and token usage. Retrieval and generation are separate functions so they can be traced separately (Langfuse is the next task). |
+| `rag.py` | `retrieve(question)` embeds the question with `kind: "query"` and returns the top-k `Chunk`s from Qdrant. `get_prompt(...)` fetches the `rag-chat` prompt from Langfuse and fills in the context and question. `build_messages(...)` puts the history between its system and user messages. `generate(messages, prompt)` calls the LLM, with retries, and returns the answer and token usage. Each step is a Langfuse span ([observability.md](observability.md)). |
+| `prompts.py` | The `rag-chat` prompt: the source for Langfuse and the fallback when Langfuse is unreachable |
+| `langfuse_setup.py` | Model prices and the prompt in Langfuse (`make chatbot-langfuse-setup`) |
+| `show_trace.py` | Prints a trace tree (`make chatbot-trace`) |
 | `app.py` | HTTP layer: `POST /chat`, `GET /healthz`, `GET /` (static page) and the in-memory session history. |
 | `static/index.html` | Minimal chat page. It keeps `user_id` in `localStorage` and `session_id` in `sessionStorage`, and "New conversation" starts a new session. Each answer has a collapsible source list and an empty `.feedback` slot for the thumbs up/down buttons that come later. |
 
@@ -48,6 +52,7 @@ The response is below. `message_id` is there so feedback can be attached to an a
 ```json
 {
   "message_id": "uuid",
+  "trace_id": "0b52d107871054814e88d8fdce37fac9",
   "session_id": "abc",
   "answer": "... [1].",
   "model": "glm-4.7-flash",
@@ -61,10 +66,10 @@ The service returns `502` with a short `detail` if retrieval (embedder/Qdrant) o
 
 ### Prompt and history
 
-- The system prompt says to answer only from the numbered passages, cite them as `[n]`, and say "I don't know from the documentation" when the passages don't cover the question.
+- The prompt (`rag-chat` in Langfuse, source in `prompts.py`) says to answer only from the numbered passages, cite them as `[n]`, and say "I don't know from the documentation" when the passages don't cover the question.
 - The current question is sent with its top-k passages. History holds only the earlier questions and answers, not their passages, to keep prompts small: about 900–1500 prompt tokens per turn.
 - History is per `session_id`, held in memory. The last `MAX_HISTORY_TURNS` (6) pairs are kept, for at most `MAX_SESSIONS` (1000) sessions, with the oldest dropped first. A pod restart clears it. That's also why the Deployment runs one replica.
-- `user_id` is accepted and validated but not used yet. It's there for Langfuse.
+- `user_id` and `session_id` are set on the Langfuse trace.
 
 ## Config
 
@@ -81,7 +86,8 @@ Most settings come from the `chatbot-config` ConfigMap, which `make chatbot-up` 
 | `COLLECTION` | `COLLECTION` | `docs` | |
 | `EMBEDDER_URL` | `EMBEDDER_URL` | `http://embedder.app.svc.cluster.local:8000` | |
 | `QDRANT_URL` | `QDRANT_URL` | `http://qdrant.qdrant.svc.cluster.local:6333` | `QDRANT_API_KEY` is optional and not set |
-| `LLM_TIMEOUT`, `LLM_MAX_RETRIES` | – | `60`, `3` | Code defaults. The SDK retries 429/5xx with backoff. |
+| `LLM_TIMEOUT`, `LLM_MAX_RETRIES` | – | `60`, `3` | Code defaults. `rag.generate()` retries 429/5xx/connection errors with backoff, and each attempt shows up in the trace. |
+| `LANGFUSE_*` | `LANGFUSE_URL`, `LANGFUSE_ENVIRONMENT`, `LANGFUSE_PROMPT_LABEL` | | See [observability.md](observability.md). Keys come from Secret `app/langfuse-api`. |
 | `MAX_HISTORY_TURNS`, `MAX_SESSIONS` | – | `6`, `1000` | Code defaults |
 | `ZAI_API_KEY` | – | – | From Secret `app/zai-api` |
 
@@ -94,7 +100,7 @@ make chatbot-up                              # after code changes: rebuilds, rel
 make chatbot-up LLM_MODEL=glm-5.3-flash      # config change only (still rebuilds; it's cached and quick)
 ```
 
-`chatbot-up` always runs `rollout restart`, because the image tag (`CHATBOT_IMAGE`, `chatbot:0.1.0`) stays the same between builds and `kind load` replaces the image on the node in place. Bump the tag in the `Makefile` when you release a meaningful change, as with the other services.
+`chatbot-up` always runs `rollout restart`, because the image tag (`CHATBOT_IMAGE`, `chatbot:0.2.0`) stays the same between builds and `kind load` replaces the image on the node in place. Bump the tag in the `Makefile` when you release a meaningful change, as with the other services.
 
 Footprint: the image is about 390 MB. The pod uses about 100 MiB (requests 50m / 128Mi, limit 512Mi). The kind node stayed at about 6.7 GB.
 
@@ -118,7 +124,7 @@ Latency is about 3–4 s per turn, almost all of it the LLM call. Embedding and 
 
 ## Surprises
 
-- **Z.AI returns HTTP 429 with code `1305` ("The service may be temporarily overloaded")** on the free model now and then, even for the very first request. The key itself was fine, and the retry succeeded. The SDK's `max_retries` (`LLM_MAX_RETRIES=3`, exponential backoff) handles it. If it keeps happening, the user sees a 502 `LLM call failed: RateLimitError 429`.
+- **Z.AI returns HTTP 429 with code `1305` ("The service may be temporarily overloaded")** on the free model now and then, even for the very first request. The key itself was fine, and the retry succeeded. The chatbot retries (`LLM_MAX_RETRIES=3`, exponential backoff). Since #5 the retry loop is in `rag.generate()` instead of the SDK, so every attempt is visible in Langfuse. If it keeps happening, the user sees a 502 `LLM call failed: RateLimitError 429`.
 - **`glm-5.3-flash` is not free.** Z.AI's pricing page lists it at $0.15 per 1M input tokens and $0.50 per 1M output tokens. Only `glm-4.7-flash` is listed as free. Switching is just config, but it costs money.
 - **Thinking mode is off explicitly** (`thinking: {type: disabled}`). The test calls showed `reasoning_tokens: 0` with it off. It's a Z.AI extension to the OpenAI schema, so it goes through `extra_body`.
 - **Follow-up questions retrieve on their own words only.** "Which one should I use for a database?" after a Deployment-vs-StatefulSet question finds weaker chunks, such as the common-labels WordPress/MySQL example. The model still answers sensibly from history, but sometimes cites a passage for a claim that came from the earlier turn. Query rewriting (condensing history plus the question before retrieval) would fix this and would be a good thing to observe in Langfuse.
