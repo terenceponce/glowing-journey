@@ -1,7 +1,8 @@
 # RAG chatbot (services/chatbot) in the `app` namespace.
 # The image is built locally and loaded with `kind load docker-image` (make chatbot-up).
 # Settings come from the `chatbot-config` ConfigMap (created by `make chatbot-up` from Makefile variables);
-# the Z.AI key comes from the `zai-api` Secret (make chatbot-secret, from secrets/zai.env).
+# the Z.AI key comes from the `zai-api` Secret (make chatbot-secret, from secrets/zai.env) and the Langfuse keys
+# from the `langfuse-api` Secret (make langfuse-secrets).
 # In-cluster URL: http://chatbot.app.svc.cluster.local:8000
 apiVersion: apps/v1
 kind: Deployment
@@ -22,7 +23,7 @@ spec:
     spec:
       containers:
         - name: chatbot
-          image: chatbot:0.1.0
+          image: chatbot:0.2.0
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
@@ -30,6 +31,8 @@ spec:
           envFrom:
             - configMapRef:
                 name: chatbot-config
+            - secretRef:
+                name: langfuse-api  # LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY
           env:
             - name: ZAI_API_KEY
               valueFrom:

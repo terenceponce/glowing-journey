@@ -1,0 +1,30 @@
+# One-shot Job that sets up Langfuse for the chatbot: GLM model prices and the `rag-chat` prompt
+# (services/chatbot/langfuse_setup.py, baked into the chatbot image). Idempotent.
+# Run with `make chatbot-langfuse-setup`, which sets the image tag.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: chatbot-langfuse-setup
+  namespace: app
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 600
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: setup
+          image: chatbot:0.2.0
+          imagePullPolicy: IfNotPresent
+          command: ["python", "langfuse_setup.py"]
+          envFrom:
+            - configMapRef:
+                name: chatbot-config  # LANGFUSE_BASE_URL
+            - secretRef:
+                name: langfuse-api
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 256Mi

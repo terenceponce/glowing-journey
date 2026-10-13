@@ -16,7 +16,7 @@ QDRANT_CHART_VERSION ?= 1.19.2
 PLATFORM       ?= linux/arm64
 EMBEDDER_IMAGE ?= embedder:0.1.1
 INGEST_IMAGE   ?= ingest:0.1.0
-CHATBOT_IMAGE  ?= chatbot:0.1.0
+CHATBOT_IMAGE  ?= chatbot:0.2.0
 
 # Corpus baked into the ingest image: a pinned commit of kubernetes/website.
 CORPUS_REPO ?= https://github.com/kubernetes/website.git
@@ -40,12 +40,18 @@ LLM_THINKING    ?= disabled
 TOP_K           ?= 5
 CHATBOT_PORT    ?= 8080
 
+# Langfuse tracing for the chatbot (keys come from the app/langfuse-api Secret).
+LANGFUSE_URL          ?= http://langfuse-web.langfuse.svc.cluster.local:3000
+LANGFUSE_ENVIRONMENT  ?= lab
+LANGFUSE_PROMPT_LABEL ?= production
+
 .PHONY: help cluster-up cluster-down cluster-status \
 	langfuse-prereqs langfuse-secrets langfuse-up langfuse-down langfuse-purge langfuse-status langfuse-ui langfuse-test \
 	qdrant-up qdrant-down qdrant-purge qdrant-status qdrant-ui \
 	embedder-image embedder-up embedder-down embedder-test \
 	ingest-image ingest query \
-	chatbot-secret chatbot-image chatbot-up chatbot-down chatbot-status chatbot-logs chatbot-ui chatbot-test
+	chatbot-secret chatbot-image chatbot-config chatbot-langfuse-setup chatbot-up chatbot-down chatbot-status \
+	chatbot-logs chatbot-ui chatbot-test chatbot-trace
 
 help: ## List targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-16s %s\n", $$1, $$2}'
@@ -182,14 +188,28 @@ chatbot-image: ## Build the chatbot image and load it into kind
 	docker build --platform $(PLATFORM) -t $(CHATBOT_IMAGE) services/chatbot
 	kind load docker-image $(CHATBOT_IMAGE) --name $(CLUSTER_NAME)
 
-chatbot-up: chatbot-secret chatbot-image ## Write chatbot-config, deploy the chatbot to the app namespace and wait until Ready
+chatbot-config: ## Write the chatbot-config ConfigMap from the Makefile variables
 	$(KUBECTL) -n app create configmap chatbot-config \
 		--from-literal=EMBEDDER_URL=$(EMBEDDER_URL) --from-literal=QDRANT_URL=$(QDRANT_URL) \
 		--from-literal=COLLECTION=$(COLLECTION) --from-literal=TOP_K=$(TOP_K) \
 		--from-literal=LLM_BASE_URL=$(LLM_BASE_URL) --from-literal=LLM_MODEL=$(LLM_MODEL) \
 		--from-literal=LLM_TEMPERATURE=$(LLM_TEMPERATURE) --from-literal=LLM_MAX_TOKENS=$(LLM_MAX_TOKENS) \
 		--from-literal=LLM_THINKING=$(LLM_THINKING) \
+		--from-literal=LANGFUSE_BASE_URL=$(LANGFUSE_URL) --from-literal=LANGFUSE_TRACING_ENVIRONMENT=$(LANGFUSE_ENVIRONMENT) \
+		--from-literal=LANGFUSE_PROMPT_LABEL=$(LANGFUSE_PROMPT_LABEL) \
 		--dry-run=client -o yaml | $(KUBECTL) apply -f -
+
+chatbot-langfuse-setup: chatbot-image chatbot-config ## Create the GLM model prices and the rag-chat prompt in Langfuse (idempotent)
+	$(KUBECTL) -n app delete job chatbot-langfuse-setup --ignore-not-found
+	sed 's|image: chatbot:.*|image: $(CHATBOT_IMAGE)|' deploy/app/langfuse-setup-job.yaml | $(KUBECTL) apply -f -
+	@for i in $$(seq 1 60); do \
+		s=$$($(KUBECTL) -n app get job chatbot-langfuse-setup -o jsonpath='{.status.conditions[?(@.status=="True")].type}'); \
+		case "$$s" in *Complete*) break;; *Failed*) $(KUBECTL) -n app logs job/chatbot-langfuse-setup --tail=30; exit 1;; esac; \
+		sleep 2; \
+	done
+	$(KUBECTL) -n app logs job/chatbot-langfuse-setup
+
+chatbot-up: chatbot-secret chatbot-langfuse-setup ## Build, set up Langfuse, deploy the chatbot to the app namespace and wait until Ready
 	$(KUBECTL) apply -f deploy/app/chatbot.yaml
 	$(KUBECTL) -n app set image deploy/chatbot chatbot=$(CHATBOT_IMAGE)
 	$(KUBECTL) -n app rollout restart deploy/chatbot
@@ -208,11 +228,17 @@ chatbot-logs: ## Follow the chatbot logs
 chatbot-ui: ## Port-forward the chat page to http://localhost:8080 (CHATBOT_PORT)
 	$(KUBECTL) -n app port-forward svc/chatbot $(CHATBOT_PORT):8000
 
-chatbot-test: ## Ask Q through POST /chat from inside the cluster and print the answer and sources
-	$(KUBECTL) -n app run chatbot-test --rm -i --restart=Never --quiet --image=$(CHATBOT_IMAGE) --env=Q="$(Q)" -- \
+SESSION ?= make-test
+chatbot-test: ## Ask Q through POST /chat from inside the cluster (same SESSION = same conversation) and print the answer
+	$(KUBECTL) -n app run chatbot-test --rm -i --restart=Never --quiet --image=$(CHATBOT_IMAGE) --env=Q="$(Q)" --env=SESSION="$(SESSION)" -- \
 		python -c "import json, os, urllib.request as u; \
-		r = u.Request('http://chatbot:8000/chat', json.dumps({'session_id': 'make-test', 'user_id': 'make-test', \
+		r = u.Request('http://chatbot:8000/chat', json.dumps({'session_id': os.environ['SESSION'], 'user_id': 'make-test', \
 		'message': os.environ['Q']}).encode(), {'content-type': 'application/json'}); d = json.load(u.urlopen(r, timeout=180)); \
 		print('Q:', os.environ['Q']); print('A:', d['answer']); print(); \
 		[print(f\"[{s['n']}] {s['score']:.3f} {s['source']} [{s['title']} > {s['section'] or '-'}] #{s['chunk_index']}\") for s in d['sources']]; \
-		print(); print('model', d['model'], 'usage', d['usage'])"
+		print(); print('model', d['model'], 'usage', d['usage']); print('trace_id', d['trace_id'])"
+
+TRACE ?=
+chatbot-trace: ## Print a Langfuse trace as a tree (make chatbot-trace TRACE=<trace-id>, from chatbot-test or the UI)
+	@test -n "$(TRACE)" || (echo "usage: make chatbot-trace TRACE=<trace-id>"; exit 1)
+	$(KUBECTL) -n app exec deploy/chatbot -- python show_trace.py $(TRACE)
