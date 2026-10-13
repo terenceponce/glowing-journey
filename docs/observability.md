@@ -1,6 +1,6 @@
 # Observability: tracing the chatbot with Langfuse
 
-Every `POST /chat` produces one nested trace in the self-hosted Langfuse ([langfuse.md](langfuse.md)). It records latency per step, the retrieval query and results, the exact LLM input and output, tokens, cost and the prompt version. Turns of one conversation are grouped into a Langfuse session.
+Every `POST /chat` produces one nested trace in the self-hosted Langfuse ([langfuse.md](langfuse.md)). It records latency per step, the retrieval query and results, the exact LLM input and output, tokens, cost and the prompt version. Turns of one conversation are grouped into a Langfuse session. Users can rate each answer, and the rating is stored as the score `user-feedback` on that turn's trace ([below](#user-feedback-score)).
 
 ## Quick start
 
@@ -8,7 +8,8 @@ Every `POST /chat` produces one nested trace in the self-hosted Langfuse ([langf
 make chatbot-up                                   # also runs chatbot-langfuse-setup (model prices + prompt)
 make chatbot-test SESSION=demo Q="What is a Pod?" # prints trace_id at the end
 make chatbot-test SESSION=demo Q="How do I scale it?"
-make chatbot-trace TRACE=<trace_id>               # the trace as a tree, read back from the Langfuse API
+make chatbot-trace TRACE=<trace_id>               # the trace as a tree plus its scores, read back from the Langfuse API
+make chatbot-feedback TRACE=<trace_id> VOTE=down COMMENT="Missed the point"  # rate it like the chat page does
 make langfuse-ui                                  # http://localhost:3000 → Tracing / Sessions
 ```
 
@@ -16,13 +17,15 @@ make langfuse-ui                                  # http://localhost:3000 → Tr
 |---|---|
 | `chatbot-langfuse-setup` | Runs `services/chatbot/langfuse_setup.py` as a Job (chatbot image, `langfuse-api` Secret). Creates or updates the GLM model prices and the `rag-chat` prompt. Idempotent: it prints "up to date" when nothing changed. `chatbot-up` runs it. |
 | `chatbot-config` | Writes the `chatbot-config` ConfigMap, now including the Langfuse settings below |
-| `chatbot-trace TRACE=<id>` | Runs `show_trace.py` in the chatbot pod: observation tree with latency, level, model, usage, cost, prompt version, retry attempts and the retrieval query |
+| `chatbot-trace TRACE=<id>` | Runs `show_trace.py` in the chatbot pod: observation tree with latency, level, model, usage, cost, prompt version, retry attempts and the retrieval query, then the trace's scores |
+| `chatbot-feedback TRACE=<id> VOTE=up\|down [COMMENT=...]` | Calls `POST /feedback` from inside the chatbot pod (metadata `source: make`), then polls `/api/public/v3/scores` until the score shows that value and comment (fails after 30 s) |
 | `chatbot-test SESSION=<id> Q=...` | Same `SESSION` = same conversation. Prints `trace_id` |
 
 ## Trace model
 
 ```
-trace "chat"   user_id, session_id, tags [env:lab, version:0.2.0, model:glm-4.7-flash], version 0.2.0, environment lab
+trace "chat"   user_id, session_id, tags [env:lab, version:0.3.0, model:glm-4.7-flash], version 0.3.0, environment lab
+│                score user-feedback (NUMERIC, 1 = 👍, 0 = 👎) + optional comment, once the user votes
 └─ SPAN chat                  input {message, history_turns}  output {answer, sources}  metadata {message_id}
    ├─ EMBEDDING embed-query   input {text, kind: query}  output {dim: 384}  model BAAI/bge-small-en-v1.5
    ├─ RETRIEVER retrieve      input {query, top_k, collection}
@@ -76,6 +79,46 @@ Three questions with the same `SESSION`. The third question failed once with a 5
 
 In the UI, **Sessions → `session-demo-…`** shows these traces in order as one conversation, with each input and answer, plus the session's total cost and duration. The follow-up weakness from #4 is easy to see: `retrieve.input.query` is just "How do I scale it?". The history isn't used, so retrieval can't know that "it" means a StatefulSet. Retrieved chunk IDs and scores are recorded per turn, which makes it easy to compare against a future query-rewriting step.
 
+## User feedback score
+
+Each answer on the chat page has 👍 / 👎 buttons. After a vote, a comment box appears ("Send comment" or Enter). The page sends `POST /feedback`:
+
+```json
+{"trace_id": "<ChatResponse.trace_id>", "value": 1, "comment": "optional, ≤ 1000 chars", "user_id": "user-…"}
+```
+
+`value` must be `1` (up) or `0` (down), and `trace_id` must be 32 hex characters (otherwise 422). The chatbot records the Langfuse score:
+
+| Field | Value |
+|---|---|
+| name | `user-feedback` |
+| id | `user-feedback-<trace_id>`: one feedback score per turn |
+| value / data type | `1` = up, `0` = down, `NUMERIC` (so averages and `user-feedback < 1` filters work) |
+| target | the trace (not an observation) |
+| comment | the user's comment, or empty |
+| metadata | `{user_id, source}`: `source` is `chat-page` or `make` |
+| environment | `lab`, the SDK's tracing environment, same as the trace |
+
+The score goes through the SDK's background queue like the spans (`langfuse.create_score`), so `POST /feedback` returns at once, and a dead Langfuse doesn't break the page.
+
+**Changing a vote updates the score.** Langfuse overwrites a score only when the **id, name and date of the timestamp** all match. In ClickHouse, `scores` is a `ReplacingMergeTree` ordered by `(project_id, toDate(timestamp), name, id)`. So `/feedback` first looks the score up with `GET /api/public/v3/scores?id=…` and reuses its timestamp, and it only uses "now" for the first vote. It also always sends the whole score, including an empty comment (see Surprises).
+
+### Reading scores back
+
+`/api/public/scores` and `/api/public/v2/scores` return 404 "not available … in Langfuse v4 events_only mode". **`GET /api/public/v3/scores`** works and filters by `traceId`, `id`, `name`, `sessionId`, `value`, timestamps and more. It returns only core fields unless asked: `fields=details` adds `comment` and `metadata`, and `fields=subject` adds what the score is attached to. `make chatbot-trace` and `make chatbot-feedback` use it.
+
+Example: vote 👍, then change it to 👎 with a comment, then back to 👍 without one (`make chatbot-feedback`, trace `3f9ce76a…`):
+
+```
+  - user-feedback=1  NUMERIC  on trace  id=user-feedback-3f9ce76a…  metadata={"user_id":"make-test","source":"make"}  timestamp=2026-10-13T06:56:59.801Z
+  - user-feedback=0  NUMERIC  on trace  id=user-feedback-3f9ce76a…  comment="Too long, missed the shared network part"  …  timestamp=2026-10-13T06:56:59.801Z
+  - user-feedback=1  NUMERIC  on trace  id=user-feedback-3f9ce76a…  metadata={"user_id":"make-test","source":"make"}  timestamp=2026-10-13T06:56:59.801Z
+```
+
+Each read returned exactly one score with the first vote's timestamp. A read-only ClickHouse query showed two physical rows (`SELECT … FROM scores WHERE trace_id=…`) until a background merge, but one with `FINAL` (`value 1`, empty comment), which is what the API and UI show. Flipping a vote about 1 s after the first one (before the first was ingested) also ended in one score: the lookup found nothing and used "now", which falls on the same date.
+
+In the Langfuse UI, the score belongs to the trace (Tracing → the trace). Per the Langfuse docs, the traces table can be filtered by `user-feedback < 1` to find disliked answers. The chat page's own requests (`POST /chat`, then `POST /feedback` with `source: chat-page`) were also replayed with curl through `make chatbot-ui`, with the same results.
+
 ## Prompt management
 
 - The prompt is the chat prompt **`rag-chat`** with two messages. The `system` message holds the rules, and the `user` message has `{{context}}` and `{{question}}`. History is inserted between them. Source: `services/chatbot/prompts.py`.
@@ -106,7 +149,7 @@ Z.AI returns OpenAI-style usage (`prompt_tokens_details.cached_tokens`). Langfus
 | `LANGFUSE_PROMPT_CACHE_TTL` | – | `60` | Code default |
 | `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY` | – | – | Secret `app/langfuse-api` (`envFrom`) |
 
-The app version (the `version:` tag and the trace's version) comes from `services/chatbot/pyproject.toml` (`0.2.0`). Bump it together with `CHATBOT_IMAGE`.
+The app version (the `version:` tag and the trace's version) comes from `services/chatbot/pyproject.toml` (`0.3.0`). The examples above were recorded with 0.2.0. Bump it together with `CHATBOT_IMAGE`.
 
 ## Resilience
 
@@ -121,4 +164,7 @@ The app version (the `version:` tag and the trace's version) comes from `service
 - **Langfuse v4 events_only mode limits the read API.** `/api/public/traces`, `/api/public/sessions/{id}` and `/api/public/metrics/daily` all return "not available … in Langfuse v4 events_only mode". `GET /api/public/v2/observations` works with `traceId=` or `sessionId=`, but it doesn't return tags or the trace name. Those are stored, though: a read-only ClickHouse query on `events_core` showed `trace_name: chat` and the three tags on every observation. Use the UI to see them.
 - **Stored chat prompts come back with an extra `"type": "message"`** on each message, so the setup script compares only role and content. Before that fix, a re-run created a needless version 2.
 - **The SDK's `get_prompt` docstring says `fetch_timeout_seconds` is in milliseconds.** The code passes it as seconds.
+- **A score update needs the same id, name *and* date.** The Langfuse docs say a matching id alone isn't enough, and the ClickHouse sort key shows why. A vote changed on a later day would create a second score unless the original timestamp is reused, which is why `/feedback` looks it up first.
+- **`create_score(comment=None)` doesn't clear a comment.** The SDK leaves `None` fields out of the ingestion event, and Langfuse merges the missing fields from the stored score (a "partial update", which the docs call deprecated). Changing 👎 + comment to 👍 without a comment kept the old comment until `/feedback` started sending `comment: ""`.
+- **The v3 scores API returns core fields only.** Without `fields=details`, `comment` and `metadata` are missing from the response, which looks as if they weren't stored.
 - **The OpenAI wrapper works with openai 3.29**, although the Langfuse docs only mention 1.x. `chat.completions.create` has no version gate; only `parse` (≥ 1.50 / 1.92) and the Responses API (≥ 1.66) do. `name`, `metadata` and `langfuse_prompt` are stripped before the request goes to Z.AI.

@@ -65,6 +65,7 @@ make chatbot-up      # Secret from secrets/zai.env, build, deploy to the app nam
 make chatbot-test    # one question through POST /chat
 make chatbot-ui      # chat page at http://localhost:8080
 make chatbot-trace TRACE=<trace_id>  # the turn's Langfuse trace (also in the Langfuse UI)
+make chatbot-feedback TRACE=<trace_id> VOTE=up  # rate an answer, like the 👍/👎 on the chat page
 ```
 
 See [docs/cluster.md](docs/cluster.md), [docs/langfuse.md](docs/langfuse.md), [docs/vector-store.md](docs/vector-store.md), [docs/chatbot.md](docs/chatbot.md) and [docs/observability.md](docs/observability.md) for details.

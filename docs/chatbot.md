@@ -36,8 +36,8 @@ make chatbot-down     # remove Deployment + Service (keeps Secret and ConfigMap)
 | `prompts.py` | The `rag-chat` prompt: the source for Langfuse and the fallback when Langfuse is unreachable |
 | `langfuse_setup.py` | Model prices and the prompt in Langfuse (`make chatbot-langfuse-setup`) |
 | `show_trace.py` | Prints a trace tree (`make chatbot-trace`) |
-| `app.py` | HTTP layer: `POST /chat`, `GET /healthz`, `GET /` (static page) and the in-memory session history. |
-| `static/index.html` | Minimal chat page. It keeps `user_id` in `localStorage` and `session_id` in `sessionStorage`, and "New conversation" starts a new session. Each answer has a collapsible source list and an empty `.feedback` slot for the thumbs up/down buttons that come later. |
+| `app.py` | HTTP layer: `POST /chat`, `POST /feedback` ([observability.md](observability.md#user-feedback-score)), `GET /healthz`, `GET /` (static page) and the in-memory session history. |
+| `static/index.html` | Minimal chat page. It keeps `user_id` in `localStorage` and `session_id` in `sessionStorage`, and "New conversation" starts a new session. Each answer has a collapsible source list and thumbs up/down buttons with an optional comment, which call `POST /feedback`. |
 
 ### API
 
@@ -100,7 +100,7 @@ make chatbot-up                              # after code changes: rebuilds, rel
 make chatbot-up LLM_MODEL=glm-5.3-flash      # config change only (still rebuilds; it's cached and quick)
 ```
 
-`chatbot-up` always runs `rollout restart`, because the image tag (`CHATBOT_IMAGE`, `chatbot:0.2.0`) stays the same between builds and `kind load` replaces the image on the node in place. Bump the tag in the `Makefile` when you release a meaningful change, as with the other services.
+`chatbot-up` always runs `rollout restart`, because the image tag (`CHATBOT_IMAGE`, `chatbot:0.3.0`) stays the same between builds and `kind load` replaces the image on the node in place. Bump the tag in the `Makefile` when you release a meaningful change, as with the other services.
 
 Footprint: the image is about 390 MB. The pod uses about 100 MiB (requests 50m / 128Mi, limit 512Mi). The kind node stayed at about 6.7 GB.
 
