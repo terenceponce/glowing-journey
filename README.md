@@ -68,4 +68,11 @@ make chatbot-trace TRACE=<trace_id>  # the turn's Langfuse trace (also in the La
 make chatbot-feedback TRACE=<trace_id> VOTE=up  # rate an answer, like the 👍/👎 on the chat page
 ```
 
-See [docs/cluster.md](docs/cluster.md), [docs/langfuse.md](docs/langfuse.md), [docs/vector-store.md](docs/vector-store.md), [docs/chatbot.md](docs/chatbot.md) and [docs/observability.md](docs/observability.md) for details.
+Then the LLM judge (groundedness and answer-relevance scores, on the free model):
+
+```sh
+make judge-setup     # Langfuse LLM connection, evaluators and rule (see docs/evals.md for why they're paused)
+make judge           # score the latest chat turns; resumable, one request at a time
+```
+
+See [docs/cluster.md](docs/cluster.md), [docs/langfuse.md](docs/langfuse.md), [docs/vector-store.md](docs/vector-store.md), [docs/chatbot.md](docs/chatbot.md), [docs/observability.md](docs/observability.md) and [docs/evals.md](docs/evals.md) for details.
