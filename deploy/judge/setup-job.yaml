@@ -1,0 +1,46 @@
+# One-shot Job that sets up Langfuse's LLM-as-judge: the Z.AI LLM connection, the groundedness and
+# answer-relevance evaluators and the chat-judge evaluation rule (scripts/judge_setup.py). Idempotent.
+# Run with `make judge-setup`, which creates the judge-scripts ConfigMap and judge-config and sets the image tag.
+# Uses the chatbot image for its Python, httpx and langfuse.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: judge-setup
+  namespace: app
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 600
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: setup
+          image: chatbot:0.3.0
+          imagePullPolicy: IfNotPresent
+          command: ["python", "/scripts/judge_setup.py"]
+          envFrom:
+            - configMapRef:
+                name: chatbot-config  # LANGFUSE_BASE_URL, LANGFUSE_TRACING_ENVIRONMENT
+            - configMapRef:
+                name: judge-config
+            - secretRef:
+                name: langfuse-api
+          env:
+            - name: ZAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: zai-api
+                  key: ZAI_API_KEY
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 256Mi
+      volumes:
+        - name: scripts
+          configMap:
+            name: judge-scripts

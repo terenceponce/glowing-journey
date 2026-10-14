@@ -45,13 +45,29 @@ LANGFUSE_URL          ?= http://langfuse-web.langfuse.svc.cluster.local:3000
 LANGFUSE_ENVIRONMENT  ?= lab
 LANGFUSE_PROMPT_LABEL ?= production
 
+# LLM-as-judge (docs/evals.md). Stays on the free model: never point JUDGE_MODEL at a paid one.
+JUDGE_PROVIDER     ?= zai
+JUDGE_BASE_URL     ?= $(LLM_BASE_URL)
+JUDGE_MODEL        ?= glm-4.7-flash
+JUDGE_RULE_ENABLED ?= false
+JUDGE_SAMPLING     ?= 1
+JUDGE_LIMIT        ?= 10
+JUDGE_TRACES       ?=
+JUDGE_FORCE        ?= false
+JUDGE_MAX_ATTEMPTS ?= 8
+JUDGE_BACKOFF_BASE ?= 2
+JUDGE_BACKOFF_MAX  ?= 60
+JUDGE_PAUSE        ?= 2
+JUDGE_TIMEOUT      ?= 120
+
 .PHONY: help cluster-up cluster-down cluster-status \
 	langfuse-prereqs langfuse-secrets langfuse-up langfuse-down langfuse-purge langfuse-status langfuse-ui langfuse-test \
 	qdrant-up qdrant-down qdrant-purge qdrant-status qdrant-ui \
 	embedder-image embedder-up embedder-down embedder-test \
 	ingest-image ingest query \
 	chatbot-secret chatbot-image chatbot-config chatbot-langfuse-setup chatbot-up chatbot-down chatbot-status \
-	chatbot-logs chatbot-ui chatbot-test chatbot-trace chatbot-feedback
+	chatbot-logs chatbot-ui chatbot-test chatbot-trace chatbot-feedback \
+	judge-config judge-setup judge
 
 help: ## List targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-16s %s\n", $$1, $$2}'
@@ -254,3 +270,35 @@ chatbot-feedback: ## Rate a turn like the chat page does (make chatbot-feedback 
 		'comment': os.environ['COMMENT'] or None, 'user_id': 'make-test', 'source': 'make'}).encode(), {'content-type': 'application/json'}); \
 		print(u.urlopen(r, timeout=30).read().decode())"
 	$(KUBECTL) -n app exec deploy/chatbot -- python show_trace.py --scores $(TRACE) $(if $(filter up,$(VOTE)),1,0) "$(COMMENT)"
+
+judge-config: ## Write the judge-config ConfigMap and the judge-scripts ConfigMap (scripts/judge*.py)
+	$(KUBECTL) -n app create configmap judge-config \
+		--from-literal=JUDGE_PROVIDER=$(JUDGE_PROVIDER) --from-literal=JUDGE_BASE_URL=$(JUDGE_BASE_URL) \
+		--from-literal=JUDGE_MODEL=$(JUDGE_MODEL) --from-literal=JUDGE_RULE_ENABLED=$(JUDGE_RULE_ENABLED) \
+		--from-literal=JUDGE_SAMPLING=$(JUDGE_SAMPLING) --from-literal=JUDGE_LIMIT=$(JUDGE_LIMIT) \
+		--from-literal=JUDGE_TRACES=$(JUDGE_TRACES) --from-literal=JUDGE_FORCE=$(JUDGE_FORCE) \
+		--from-literal=JUDGE_MAX_ATTEMPTS=$(JUDGE_MAX_ATTEMPTS) \
+		--from-literal=JUDGE_BACKOFF_BASE=$(JUDGE_BACKOFF_BASE) --from-literal=JUDGE_BACKOFF_MAX=$(JUDGE_BACKOFF_MAX) \
+		--from-literal=JUDGE_PAUSE=$(JUDGE_PAUSE) --from-literal=JUDGE_TIMEOUT=$(JUDGE_TIMEOUT) \
+		--dry-run=client -o yaml | $(KUBECTL) apply -f -
+	$(KUBECTL) -n app create configmap judge-scripts --from-file=scripts/judge_prompts.py \
+		--from-file=scripts/judge_setup.py --from-file=scripts/judge.py \
+		--dry-run=client -o yaml | $(KUBECTL) apply -f -
+
+judge-setup: chatbot-secret judge-config ## Langfuse LLM connection (key from secrets/zai.env), evaluators and rule (JUDGE_RULE_ENABLED=true to turn it on)
+	$(KUBECTL) -n app delete job judge-setup --ignore-not-found
+	sed 's|image: chatbot:.*|image: $(CHATBOT_IMAGE)|' deploy/judge/setup-job.yaml | $(KUBECTL) apply -f -
+	@for i in $$(seq 1 60); do \
+		s=$$($(KUBECTL) -n app get job judge-setup -o jsonpath='{.status.conditions[?(@.status=="True")].type}'); \
+		case "$$s" in *Complete*) break;; *Failed*) $(KUBECTL) -n app logs job/judge-setup --tail=30; exit 1;; esac; \
+		sleep 2; \
+	done
+	$(KUBECTL) -n app logs job/judge-setup
+
+judge: chatbot-secret judge-config ## Script judge: score the latest JUDGE_LIMIT chat turns (or JUDGE_TRACES=id,id), resumable; JUDGE_FORCE=true re-scores
+	$(KUBECTL) -n app delete job judge --ignore-not-found
+	sed 's|image: chatbot:.*|image: $(CHATBOT_IMAGE)|' deploy/judge/judge-job.yaml | $(KUBECTL) apply -f -
+	$(KUBECTL) -n app wait --for=condition=Ready pod -l job-name=judge --timeout=2m || true
+	$(KUBECTL) -n app logs -f job/judge
+	@s=$$($(KUBECTL) -n app get job judge -o jsonpath='{.status.conditions[?(@.status=="True")].type}'); \
+	case "$$s" in *Failed*) echo "judge Job failed: $$s"; exit 1;; esac

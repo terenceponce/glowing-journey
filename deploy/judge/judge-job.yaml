@@ -1,0 +1,49 @@
+# One-shot Job that runs the script judge (scripts/judge.py): scores recent chat turns for groundedness and
+# answer relevance, one LLM request at a time, and posts the scores to Langfuse. Resumable: re-run to retry failures.
+# Run with `make judge`, which creates the judge-scripts ConfigMap and judge-config and sets the image tag.
+# Uses the chatbot image for its Python, openai, langfuse and show_trace.py.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: judge
+  namespace: app
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 7200  # the free model can be very slow; a run can take a while
+  ttlSecondsAfterFinished: 600
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: judge
+          image: chatbot:0.3.0
+          imagePullPolicy: IfNotPresent
+          command: ["python", "/scripts/judge.py"]
+          envFrom:
+            - configMapRef:
+                name: chatbot-config  # LANGFUSE_BASE_URL, LANGFUSE_TRACING_ENVIRONMENT
+            - configMapRef:
+                name: judge-config
+            - secretRef:
+                name: langfuse-api
+          env:
+            - name: PYTHONPATH
+              value: /srv
+            - name: ZAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: zai-api
+                  key: ZAI_API_KEY
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 256Mi
+      volumes:
+        - name: scripts
+          configMap:
+            name: judge-scripts
