@@ -1,6 +1,6 @@
 [project]
 name = "chatbot"
-version = "0.3.0"
+version = "0.4.0"
 description = "FastAPI RAG chatbot: Qdrant retrieval + Z.AI GLM via the OpenAI SDK, traced with Langfuse"
 requires-python = ">=3.12"
 dependencies = [

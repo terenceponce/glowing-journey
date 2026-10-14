@@ -15,7 +15,7 @@ spec:
       restartPolicy: Never
       containers:
         - name: setup
-          image: chatbot:0.3.0
+          image: chatbot:0.4.0
           imagePullPolicy: IfNotPresent
           command: ["python", "/scripts/judge_setup.py"]
           envFrom:

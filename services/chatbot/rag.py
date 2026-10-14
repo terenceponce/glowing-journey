@@ -8,11 +8,13 @@ Config (environment variables):
   TOP_K            chunks retrieved per question (default 5)
   LLM_BASE_URL     OpenAI-compatible base URL (Z.AI general API)
   LLM_MODEL        chat model, e.g. glm-4.7-flash
+  LLM_ALLOWED_MODELS  comma-separated models a request may pick with `model` (default: LLM_MODEL only)
   LLM_TEMPERATURE  sampling temperature (default 0.2)
   LLM_MAX_TOKENS   max completion tokens (default 1024)
   LLM_THINKING     "enabled" or "disabled": GLM thinking mode (default "disabled")
   LLM_TIMEOUT      seconds per LLM request (default 60)
   LLM_MAX_RETRIES  retries on 429/5xx/connection errors/timeouts, with backoff (default 3)
+  LLM_BACKOFF_BASE, LLM_BACKOFF_MAX  backoff before retry n: BASE * 2^(n-1) seconds, capped at MAX (default 1, 8)
   ZAI_API_KEY      API key, from the zai-api Secret
   LANGFUSE_PROMPT_LABEL      label of the Langfuse prompt to use (default "production")
   LANGFUSE_PROMPT_CACHE_TTL  seconds a fetched prompt is reused before a background refresh (default 60)
@@ -39,10 +41,14 @@ EMBEDDER_URL = os.environ["EMBEDDER_URL"]
 COLLECTION = os.environ.get("COLLECTION", "docs")
 TOP_K = int(os.environ.get("TOP_K", "5"))
 LLM_MODEL = os.environ["LLM_MODEL"]
+# A request can override the model (experiments), but only with one of these, so a request can't switch to a paid model.
+LLM_ALLOWED_MODELS = {m.strip() for m in os.environ.get("LLM_ALLOWED_MODELS", LLM_MODEL).split(",") if m.strip()}
 LLM_TEMPERATURE = float(os.environ.get("LLM_TEMPERATURE", "0.2"))
 LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "1024"))
 LLM_THINKING = os.environ.get("LLM_THINKING", "disabled")
 LLM_MAX_RETRIES = int(os.environ.get("LLM_MAX_RETRIES", "3"))
+LLM_BACKOFF_BASE = float(os.environ.get("LLM_BACKOFF_BASE", "1"))
+LLM_BACKOFF_MAX = float(os.environ.get("LLM_BACKOFF_MAX", "8"))
 PROMPT_LABEL = os.environ.get("LANGFUSE_PROMPT_LABEL", "production")
 PROMPT_CACHE_TTL = int(os.environ.get("LANGFUSE_PROMPT_CACHE_TTL", "60"))
 # While Langfuse is unreachable, use the built-in prompt for this long before trying again,
@@ -91,13 +97,20 @@ _fallback_until = 0.0
 _fallback_lock = threading.Lock()
 
 
-def get_prompt(question: str, chunks: list[Chunk]) -> Prompt:
+def get_prompt(question: str, chunks: list[Chunk], label: str | None = None, version: int | None = None) -> Prompt:
     """Fetch the RAG prompt from Langfuse (cached for PROMPT_CACHE_TTL) and fill in the context and question.
 
-    Falls back to prompts.RAG_CHAT_PROMPT when Langfuse is unreachable and nothing is cached yet.
+    Falls back to prompts.RAG_CHAT_PROMPT when Langfuse is unreachable and nothing is cached yet. A requested
+    `label` or `version` (experiments) has no fallback: if Langfuse can't serve it, this raises.
     """
     global _fallback_until
     variables = {"context": format_context(chunks), "question": question}
+    if version is not None or (label and label != PROMPT_LABEL):
+        client = langfuse.get_prompt(
+            prompts.PROMPT_NAME, **({"version": version} if version is not None else {"label": label}), type="chat",
+            cache_ttl_seconds=PROMPT_CACHE_TTL, max_retries=0, fetch_timeout_seconds=5,
+        )
+        return Prompt(client.compile(**variables), client, client.name, client.version)
     if time.monotonic() >= _fallback_until:
         try:
             client = langfuse.get_prompt(
@@ -181,21 +194,28 @@ def build_messages(prompt: Prompt, history: list[dict]) -> list[dict]:
     return [system, *history, user]
 
 
-def generate(messages: list[dict], prompt: Prompt) -> tuple[str, dict]:
-    """Call the LLM and return the answer text and token usage.
+def generate(
+    messages: list[dict], prompt: Prompt, model: str = LLM_MODEL, max_retries: int = LLM_MAX_RETRIES,
+    backoff_base: float = LLM_BACKOFF_BASE, backoff_max: float = LLM_BACKOFF_MAX,
+) -> tuple[str, dict]:
+    """Call the LLM (`model`, one of LLM_ALLOWED_MODELS) and return the answer text and token usage.
+
+    Retries up to `max_retries` times; experiments pass a larger budget than the chat page's default.
 
     Runs in a `generate` span. Each attempt is its own generation (from the OpenAI wrapper) with
     metadata.attempt; failed attempts are level ERROR. The span records how many attempts it took.
     """
+    if model not in LLM_ALLOWED_MODELS:
+        raise ValueError(f"model {model!r} is not in LLM_ALLOWED_MODELS")
     prompt_info = {"prompt_name": prompt.name, "prompt_version": prompt.version, "prompt_fallback": prompt.client is None}
     with langfuse.start_as_current_observation(
-        as_type="span", name="generate", input={"model": LLM_MODEL, "messages": len(messages)},
+        as_type="span", name="generate", input={"model": model, "messages": len(messages)},
     ) as span:
         errors: list[str] = []
-        for attempt in range(1, LLM_MAX_RETRIES + 2):
+        for attempt in range(1, max_retries + 2):
             try:
                 completion = llm.chat.completions.create(
-                    model=LLM_MODEL,
+                    model=model,
                     messages=messages,
                     temperature=LLM_TEMPERATURE,
                     max_tokens=LLM_MAX_TOKENS,
@@ -209,13 +229,13 @@ def generate(messages: list[dict], prompt: Prompt) -> tuple[str, dict]:
                 break
             except RETRYABLE_ERRORS as exc:
                 errors.append(f"attempt {attempt}: {type(exc).__name__} {getattr(exc, 'status_code', '') or ''}".strip())
-                if attempt > LLM_MAX_RETRIES:
+                if attempt > max_retries:
                     span.update(
                         level="ERROR", status_message=f"gave up after {attempt} attempts",
                         metadata={"attempts": attempt, "errors": errors, **prompt_info},
                     )
                     raise
-                delay = min(2 ** (attempt - 1), 8) * random.uniform(0.75, 1.25)
+                delay = min(backoff_base * 2 ** (attempt - 1), backoff_max) * random.uniform(0.75, 1.25)
                 log.warning("LLM %s, retrying in %.1fs", errors[-1], delay)
                 time.sleep(delay)
 
