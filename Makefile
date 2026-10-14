@@ -16,7 +16,7 @@ QDRANT_CHART_VERSION ?= 1.19.2
 PLATFORM       ?= linux/arm64
 EMBEDDER_IMAGE ?= embedder:0.1.1
 INGEST_IMAGE   ?= ingest:0.1.0
-CHATBOT_IMAGE  ?= chatbot:0.3.0
+CHATBOT_IMAGE  ?= chatbot:0.4.0
 
 # Corpus baked into the ingest image: a pinned commit of kubernetes/website.
 CORPUS_REPO ?= https://github.com/kubernetes/website.git
@@ -60,6 +60,20 @@ JUDGE_BACKOFF_MAX  ?= 60
 JUDGE_PAUSE        ?= 2
 JUDGE_TIMEOUT      ?= 120
 
+# Experiments (docs/experiments.md). Configs are named in scripts/run_experiment.py; all stay on the free model.
+EXPERIMENT_CONFIG       ?= baseline
+EXPERIMENT_RUN          ?=
+EXPERIMENT_ITEMS        ?=
+EXPERIMENT_PROMPT_LABEL ?= concise
+EXPERIMENT_MAX_ATTEMPTS ?= 3
+EXPERIMENT_BACKOFF_BASE ?= 30
+EXPERIMENT_BACKOFF_MAX  ?= 180
+EXPERIMENT_PAUSE        ?= 3
+EXPERIMENT_TIMEOUT      ?= 900
+EXPERIMENT_LLM_MAX_RETRIES  ?= 7
+EXPERIMENT_LLM_BACKOFF_BASE ?= 2
+EXPERIMENT_LLM_BACKOFF_MAX  ?= 60
+
 .PHONY: help cluster-up cluster-down cluster-status \
 	langfuse-prereqs langfuse-secrets langfuse-up langfuse-down langfuse-purge langfuse-status langfuse-ui langfuse-test \
 	qdrant-up qdrant-down qdrant-purge qdrant-status qdrant-ui \
@@ -67,7 +81,8 @@ JUDGE_TIMEOUT      ?= 120
 	ingest-image ingest query \
 	chatbot-secret chatbot-image chatbot-config chatbot-langfuse-setup chatbot-up chatbot-down chatbot-status \
 	chatbot-logs chatbot-ui chatbot-test chatbot-trace chatbot-feedback \
-	judge-config judge-setup judge
+	judge-config judge-setup judge \
+	experiment-config experiment-setup experiment experiment-check
 
 help: ## List targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-16s %s\n", $$1, $$2}'
@@ -302,3 +317,43 @@ judge: chatbot-secret judge-config ## Script judge: score the latest JUDGE_LIMIT
 	$(KUBECTL) -n app logs -f job/judge
 	@s=$$($(KUBECTL) -n app get job judge -o jsonpath='{.status.conditions[?(@.status=="True")].type}'); \
 	case "$$s" in *Failed*) echo "judge Job failed: $$s"; exit 1;; esac
+
+experiment-config: judge-config ## Write the experiment-config ConfigMap and the experiment-scripts ConfigMap (scripts/experiment*.py, run_experiment.py, judge*.py)
+	$(KUBECTL) -n app create configmap experiment-config \
+		--from-literal=EXPERIMENT_CONFIG=$(EXPERIMENT_CONFIG) --from-literal=EXPERIMENT_RUN=$(EXPERIMENT_RUN) \
+		--from-literal=EXPERIMENT_ITEMS=$(EXPERIMENT_ITEMS) --from-literal=EXPERIMENT_PROMPT_LABEL=$(EXPERIMENT_PROMPT_LABEL) \
+		--from-literal=EXPERIMENT_MAX_ATTEMPTS=$(EXPERIMENT_MAX_ATTEMPTS) \
+		--from-literal=EXPERIMENT_BACKOFF_BASE=$(EXPERIMENT_BACKOFF_BASE) --from-literal=EXPERIMENT_BACKOFF_MAX=$(EXPERIMENT_BACKOFF_MAX) \
+		--from-literal=EXPERIMENT_PAUSE=$(EXPERIMENT_PAUSE) --from-literal=EXPERIMENT_TIMEOUT=$(EXPERIMENT_TIMEOUT) \
+		--from-literal=EXPERIMENT_LLM_MAX_RETRIES=$(EXPERIMENT_LLM_MAX_RETRIES) \
+		--from-literal=EXPERIMENT_LLM_BACKOFF_BASE=$(EXPERIMENT_LLM_BACKOFF_BASE) \
+		--from-literal=EXPERIMENT_LLM_BACKOFF_MAX=$(EXPERIMENT_LLM_BACKOFF_MAX) \
+		--dry-run=client -o yaml | $(KUBECTL) apply -f -
+	$(KUBECTL) -n app create configmap experiment-scripts --from-file=scripts/experiment_dataset.py \
+		--from-file=scripts/experiment_setup.py --from-file=scripts/run_experiment.py \
+		--from-file=scripts/judge.py --from-file=scripts/judge_prompts.py \
+		--dry-run=client -o yaml | $(KUBECTL) apply -f -
+
+experiment-setup: experiment-config ## Create or update the rag-eval dataset and the candidate prompt version (label EXPERIMENT_PROMPT_LABEL) in Langfuse
+	$(KUBECTL) -n app delete job experiment-setup --ignore-not-found
+	sed 's|image: chatbot:.*|image: $(CHATBOT_IMAGE)|' deploy/experiments/setup-job.yaml | $(KUBECTL) apply -f -
+	@for i in $$(seq 1 60); do \
+		s=$$($(KUBECTL) -n app get job experiment-setup -o jsonpath='{.status.conditions[?(@.status=="True")].type}'); \
+		case "$$s" in *Complete*) break;; *Failed*) $(KUBECTL) -n app logs job/experiment-setup --tail=30; exit 1;; esac; \
+		sleep 2; \
+	done
+	$(KUBECTL) -n app logs job/experiment-setup
+
+experiment: chatbot-secret experiment-config ## Run the dataset under EXPERIMENT_CONFIG as dataset run EXPERIMENT_RUN (default: the config name), judge it; resumable
+	$(KUBECTL) -n app delete job experiment --ignore-not-found
+	sed 's|image: chatbot:.*|image: $(CHATBOT_IMAGE)|' deploy/experiments/experiment-job.yaml | $(KUBECTL) apply -f -
+	$(KUBECTL) -n app wait --for=condition=Ready pod -l job-name=experiment --timeout=2m || true
+	$(KUBECTL) -n app logs -f job/experiment
+	@s=$$($(KUBECTL) -n app get job experiment -o jsonpath='{.status.conditions[?(@.status=="True")].type}'); \
+	case "$$s" in *Failed*) echo "experiment Job failed: $$s"; exit 1;; esac
+
+experiment-check: ## Check the defaults are back (top-k, prompt label, model, chunking, production prompt) and that the chatbot answers
+	@ingested=$$($(KUBECTL) -n app get configmap ingest-config -o jsonpath='{.data.CHUNK_SIZE}/{.data.CHUNK_OVERLAP}'); \
+	$(KUBECTL) -n app exec -i deploy/chatbot -- python - $(TOP_K) $(LANGFUSE_PROMPT_LABEL) $(LLM_MODEL) \
+		"$$ingested" $(CHUNK_SIZE)/$(CHUNK_OVERLAP) < scripts/experiment_check.py
+	$(MAKE) --no-print-directory chatbot-test Q="What is a Pod?" SESSION=experiment-check

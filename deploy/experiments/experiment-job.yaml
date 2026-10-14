@@ -1,0 +1,54 @@
+# One-shot Job that runs the eval dataset through the chatbot under one named config (scripts/run_experiment.py),
+# links the answers to a Langfuse dataset run and scores them with the script judge. One request at a time;
+# resumable: re-run the same config to retry what failed.
+# Run with `make experiment EXPERIMENT_CONFIG=<name>`, which writes the ConfigMaps and sets the image tag.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: experiment
+  namespace: app
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 14400  # 20 chat turns + 40 judgements on a rate-limited free model can take a while
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: experiment
+          image: chatbot:0.4.0
+          imagePullPolicy: IfNotPresent
+          command: ["python", "/scripts/run_experiment.py"]
+          envFrom:
+            - configMapRef:
+                name: chatbot-config  # LANGFUSE_BASE_URL, LANGFUSE_TRACING_ENVIRONMENT
+            - configMapRef:
+                name: judge-config
+            - configMapRef:
+                name: experiment-config
+            - configMapRef:
+                name: ingest-config  # how `docs` was last ingested: INGEST_CHUNK_SIZE, INGEST_CHUNK_OVERLAP
+              prefix: INGEST_
+            - secretRef:
+                name: langfuse-api
+          env:
+            - name: PYTHONPATH
+              value: /srv  # show_trace.py from the chatbot image
+            - name: ZAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: zai-api
+                  key: ZAI_API_KEY
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 256Mi
+      volumes:
+        - name: scripts
+          configMap:
+            name: experiment-scripts

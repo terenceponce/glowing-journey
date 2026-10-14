@@ -1,0 +1,42 @@
+# One-shot Job that sets up the experiments in Langfuse (scripts/experiment_setup.py): the `rag-eval` dataset and
+# the candidate `rag-chat` prompt version (label `concise`; `production` is left alone). Idempotent.
+# Run with `make experiment-setup`, which creates the experiment-scripts ConfigMap and sets the image tag.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: experiment-setup
+  namespace: app
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 600
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: setup
+          image: chatbot:0.4.0
+          imagePullPolicy: IfNotPresent
+          command: ["python", "/scripts/experiment_setup.py"]
+          envFrom:
+            - configMapRef:
+                name: chatbot-config  # LANGFUSE_BASE_URL
+            - configMapRef:
+                name: experiment-config
+            - secretRef:
+                name: langfuse-api
+          env:
+            - name: PYTHONPATH
+              value: /srv  # prompts.py from the chatbot image
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 256Mi
+      volumes:
+        - name: scripts
+          configMap:
+            name: experiment-scripts
