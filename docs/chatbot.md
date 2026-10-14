@@ -64,6 +64,21 @@ The response is below. `message_id` is there so feedback can be attached to an a
 
 The service returns `502` with a short `detail` if retrieval (embedder/Qdrant) or the LLM call fails, and `422` for an invalid body.
 
+The response also has `top_k` and `prompt` (`{name, version, fallback}`): the settings this turn actually used.
+
+**Overrides for experiments (0.4.0).** `POST /chat` takes optional fields that the experiment runner uses ([experiments.md](experiments.md)). Without them nothing changes.
+
+| Field | What |
+|---|---|
+| `top_k` | 1–20 chunks instead of `TOP_K` |
+| `prompt_label` / `prompt_version` | another version of `rag-chat` (one or the other). No built-in fallback: if Langfuse can't serve it, the turn fails with 502 `prompt unavailable` |
+| `model` | only one of `LLM_ALLOWED_MODELS`, which defaults to `LLM_MODEL` alone, so a request can't switch to a paid model (422) |
+| `history` | fixed earlier turns (`[{role, content}]`) instead of the session's; the turn isn't saved to the session |
+| `retry` | `{max_retries (≤ 12), backoff_base, backoff_max}`: LLM retry budget for this turn instead of `LLM_MAX_RETRIES` |
+| `experiment` | `{id, name, description, metadata, dataset_id, item_id, item_metadata, expected_output}`: the chatbot puts Langfuse's experiment attributes on every observation of the turn, which is how Langfuse v4 links a trace to a dataset-run item. The name becomes a trace tag `experiment:<name>` |
+
+The overrides are recorded in the `chat` span's `metadata.overrides`.
+
 ### Prompt and history
 
 - The prompt (`rag-chat` in Langfuse, source in `prompts.py`) says to answer only from the numbered passages, cite them as `[n]`, and say "I don't know from the documentation" when the passages don't cover the question.
@@ -87,6 +102,8 @@ Most settings come from the `chatbot-config` ConfigMap, which `make chatbot-up` 
 | `EMBEDDER_URL` | `EMBEDDER_URL` | `http://embedder.app.svc.cluster.local:8000` | |
 | `QDRANT_URL` | `QDRANT_URL` | `http://qdrant.qdrant.svc.cluster.local:6333` | `QDRANT_API_KEY` is optional and not set |
 | `LLM_TIMEOUT`, `LLM_MAX_RETRIES` | – | `60`, `3` | Code defaults. `rag.generate()` retries 429/5xx/connection errors with backoff, and each attempt shows up in the trace. |
+| `LLM_BACKOFF_BASE`, `LLM_BACKOFF_MAX` | – | `1`, `8` | Code defaults: wait `BASE · 2ⁿ⁻¹` s before retry n, capped at `MAX`, ±25 % jitter |
+| `LLM_ALLOWED_MODELS` | – | `LLM_MODEL` | Code default. Models a request may pick with `model`; keep it free-only |
 | `LANGFUSE_*` | `LANGFUSE_URL`, `LANGFUSE_ENVIRONMENT`, `LANGFUSE_PROMPT_LABEL` | | See [observability.md](observability.md). Keys come from Secret `app/langfuse-api`. |
 | `MAX_HISTORY_TURNS`, `MAX_SESSIONS` | – | `6`, `1000` | Code defaults |
 | `ZAI_API_KEY` | – | – | From Secret `app/zai-api` |
@@ -100,7 +117,7 @@ make chatbot-up                              # after code changes: rebuilds, rel
 make chatbot-up LLM_MODEL=glm-5.3-flash      # config change only (still rebuilds; it's cached and quick)
 ```
 
-`chatbot-up` always runs `rollout restart`, because the image tag (`CHATBOT_IMAGE`, `chatbot:0.3.0`) stays the same between builds and `kind load` replaces the image on the node in place. Bump the tag in the `Makefile` when you release a meaningful change, as with the other services.
+`chatbot-up` always runs `rollout restart`, because the image tag (`CHATBOT_IMAGE`, `chatbot:0.4.0`) stays the same between builds and `kind load` replaces the image on the node in place. Bump the tag in the `Makefile` when you release a meaningful change, as with the other services.
 
 Footprint: the image is about 390 MB. The pod uses about 100 MiB (requests 50m / 128Mi, limit 512Mi). The kind node stayed at about 6.7 GB.
 

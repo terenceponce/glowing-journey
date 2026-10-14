@@ -24,7 +24,7 @@ make langfuse-ui                                  # http://localhost:3000 → Tr
 ## Trace model
 
 ```
-trace "chat"   user_id, session_id, tags [env:lab, version:0.3.0, model:glm-4.7-flash], version 0.3.0, environment lab
+trace "chat"   user_id, session_id, tags [env:lab, version:0.4.0, model:glm-4.7-flash], version 0.4.0, environment lab
 │                score user-feedback (NUMERIC, 1 = 👍, 0 = 👎) + optional comment, once the user votes
 └─ SPAN chat                  input {message, history_turns}  output {answer, sources}  metadata {message_id}
    ├─ EMBEDDING embed-query   input {text, kind: query}  output {dim: 384}  model BAAI/bge-small-en-v1.5
@@ -151,7 +151,7 @@ Z.AI returns OpenAI-style usage (`prompt_tokens_details.cached_tokens`). Langfus
 | `LANGFUSE_PROMPT_CACHE_TTL` | – | `60` | Code default |
 | `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY` | – | – | Secret `app/langfuse-api` (`envFrom`) |
 
-The app version (the `version:` tag and the trace's version) comes from `services/chatbot/pyproject.toml` (`0.3.0`). The examples above were recorded with 0.2.0. Bump it together with `CHATBOT_IMAGE`.
+The app version (the `version:` tag and the trace's version) comes from `services/chatbot/pyproject.toml` (`0.4.0`). The examples above were recorded with 0.2.0. Bump it together with `CHATBOT_IMAGE`.
 
 ## Resilience
 

@@ -75,4 +75,12 @@ make judge-setup     # Langfuse LLM connection, evaluators and rule (see docs/ev
 make judge           # score the latest chat turns; resumable, one request at a time
 ```
 
-See [docs/cluster.md](docs/cluster.md), [docs/langfuse.md](docs/langfuse.md), [docs/vector-store.md](docs/vector-store.md), [docs/chatbot.md](docs/chatbot.md), [docs/observability.md](docs/observability.md) and [docs/evals.md](docs/evals.md) for details.
+Then experiments (a Langfuse dataset run through the chatbot under named configs, judged):
+
+```sh
+make experiment-setup                          # the rag-eval dataset and the candidate prompt version
+make experiment EXPERIMENT_CONFIG=top-k-3      # one config as a dataset run; resumable
+make experiment-check                          # defaults are back and the chatbot answers
+```
+
+See [docs/cluster.md](docs/cluster.md), [docs/langfuse.md](docs/langfuse.md), [docs/vector-store.md](docs/vector-store.md), [docs/chatbot.md](docs/chatbot.md), [docs/observability.md](docs/observability.md), [docs/evals.md](docs/evals.md) and [docs/experiments.md](docs/experiments.md) for details.
