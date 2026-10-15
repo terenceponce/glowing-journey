@@ -103,7 +103,7 @@ Two faults in one drill, because the free model supplies the second one for free
 
 **Trigger:** `make drill-llm-timeout-on` sets `LLM_TIMEOUT=1` (`DRILL_LLM_TIMEOUT`) on the chatbot: the per-request timeout of the LLM call drops from 60 s to 1 s, shorter than any real GLM answer. The **429s** need no trigger. Z.AI's free `glm-4.7-flash` returns them all the time (code 1305 "service may be temporarily overloaded", sometimes 1302 "rate limit reached"), so they turned up in every drill's traffic and are used here as real evidence.
 
-**Symptoms:** `POST /chat` returns **502** `LLM call failed: APITimeoutError` (or `RateLimitError 429`) after 7–10 s, from three LLM attempts (the drill's `DRILL_LLM_RETRIES=2`, so 3 attempts with 2 s and 4 s backoff). All three items failed. Without the timeout fault, a 429 is retried and usually the second attempt answers: 8 of the 11 turns of drills 2 and 3 needed at least one retry.
+**Symptoms:** `POST /chat` returns **502** `LLM call failed: APITimeoutError` (or `RateLimitError 429`) after 7–10 s, from three LLM attempts (the drill's `DRILL_LLM_RETRIES=2`, so 3 attempts with 2 s and 4 s backoff). All three items failed. Without the timeout fault, a 429 is retried and usually the second attempt answers: 4 of the 6 answered turns of drills 2 and 3 needed at least one retry.
 
 **Langfuse evidence** (`make drill-report DRILL=llm-timeout`), trace `22800823…` (rag-eval-01):
 
@@ -119,7 +119,7 @@ GENERATION chat-completion  1.01s  ERROR: Request timed out.
 
 - Everything before the LLM is healthy (`embed-query` 0.01 s, `retrieve` 0.01 s with normal scores). `generate` is the first ERROR, and it has `attempts` and `errors` in its metadata: one entry per try.
 - **Each attempt is its own `chat-completion` generation**, and its status message tells the two failure kinds apart. A rate limit is an immediate `Error code: 429 - {'code': '1305' …}` (0.5–0.95 s), which is Z.AI answering. A timeout is `Request timed out.` after **exactly the timeout** (1.00 s, 0.99–1.01 s over the three traces), which is our client giving up. A timeout with a constant duration equal to a configured limit is a configuration fingerprint; real network timeouts vary.
-- A 429 that is retried and wins is **not an ERROR**: the turn is level WARNING with "succeeded after 2 attempts" (see item 09 in drill 2, trace `9901c25c…`, and all three turns of drill 3). Filter `generate` by level WARNING to measure how often the model rate-limits. Here, 11 of 14 answered turns across the drills needed a retry.
+- A 429 that is retried and wins is **not an ERROR**: the turn is level WARNING with "succeeded after 2 attempts" (see item 09 in drill 2, trace `9901c25c…`, and all three turns of drill 3). Filter `generate` by level WARNING to measure how often the model rate-limits. Here, 4 of the 6 answered turns of drills 2 and 3 did.
 - Same fingerprint on the 429 side: trace `c0c6a126…` (drill 3) and `2a8f5d2f…` above show `gave up after 3 attempts` with three 429s and no timeout, i.e. a real Z.AI overload, nothing broken on our side. There is no usage on failed attempts, so they cost no tokens.
 - `chat-completion` input `prompt=rag-chat v2` is recorded on each failed attempt too, so you can see which prompt was being tried.
 
