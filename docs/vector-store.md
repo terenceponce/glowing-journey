@@ -49,7 +49,7 @@ make qdrant-ui      # http://localhost:6333/dashboard (Ctrl-C to stop)
 - **Model baked into the image.** The Dockerfile downloads the model into `/models` at build time and sets `HF_HUB_OFFLINE=1`, so the pod starts with no network access. This was verified with `docker run --network none`. To change the model, pass `--build-arg EMBED_MODEL=...` and re-ingest, since the dimension may change.
 - Env: `EMBED_THREADS` (2), `MAX_BATCH` (256 texts per request), `ONNX_BATCH_SIZE` (16 texts per ONNX call), `QUERY_PREFIX`.
 - Resources: requests 100m / 256Mi, limits 2 CPU / 1Gi. It idles at about 165 MiB and peaks around 360 MiB.
-- Image `embedder:0.1.1`, about 630 MB. It's built for `linux/arm64` and loaded with `kind load docker-image`. Bump `EMBEDDER_IMAGE` in the Makefile when the code changes.
+- Image `embedder:0.1.2`, about 630 MB. It's built for `linux/arm64` and loaded with `kind load docker-image`. Bump `EMBEDDER_IMAGE` in the Makefile when the code changes.
 
 ## Corpus
 

@@ -7,9 +7,12 @@ Config (environment variables):
   MAX_BATCH       max texts per request (default 256)
   ONNX_BATCH_SIZE texts per ONNX Runtime call; bounds peak memory (default 16)
   QUERY_PREFIX    prepended to each text when "kind" is "query" (default: none)
+  EMBED_LATENCY_MS  artificial delay added to every /embed request, in milliseconds (default 0). A fault switch
+                  for the failure drills (docs/failure-drills.md); leave it at 0 otherwise.
 """
 
 import os
+import time
 from typing import Literal
 
 from fastapi import FastAPI, HTTPException
@@ -24,6 +27,7 @@ MAX_BATCH = int(os.environ.get("MAX_BATCH", "256"))
 # needs well over 1 GiB. Smaller batches keep memory flat for the same throughput on CPU.
 ONNX_BATCH_SIZE = int(os.environ.get("ONNX_BATCH_SIZE", "16"))
 QUERY_PREFIX = os.environ.get("QUERY_PREFIX", "")
+LATENCY_MS = float(os.environ.get("EMBED_LATENCY_MS", "0"))
 
 # Loads from CACHE_DIR; the image sets HF_HUB_OFFLINE=1 so this never touches the network.
 model = TextEmbedding(model_name=MODEL_NAME, cache_dir=CACHE_DIR, threads=THREADS)
@@ -54,6 +58,8 @@ def healthz() -> dict:
 def embed(req: EmbedRequest) -> EmbedResponse:
     if len(req.texts) > MAX_BATCH:
         raise HTTPException(status_code=413, detail=f"at most {MAX_BATCH} texts per request")
+    if LATENCY_MS > 0:
+        time.sleep(LATENCY_MS / 1000)
     texts = [QUERY_PREFIX + t for t in req.texts] if req.kind == "query" else req.texts
     vectors = [v.tolist() for v in model.embed(texts, batch_size=ONNX_BATCH_SIZE)] if texts else []
     return EmbedResponse(model=MODEL_NAME, dim=DIM, vectors=vectors)

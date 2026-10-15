@@ -50,3 +50,26 @@ reference baseline: 3 answered, chat latency median 6.78s, 5 chunks per turn, to
 **Root cause:** nothing is listening where `QDRANT_URL` points. `kubectl -n qdrant get pods` shows no pod and the StatefulSet at `0/0`.
 
 **Restore:** `make drill-qdrant-down-off` scales back to 1 and waits for the rollout. The PVC kept the data: `drill-check` shows `docs` with 3048 points, and the chatbot answers.
+
+## 2. Embedding service slowed down
+
+**Trigger:** `make drill-embedder-slow-on` adds `DRILL_EMBED_LATENCY_MS` (default 4000) to every `POST /embed`. It sets `EMBED_LATENCY_MS` on the embedder Deployment, a flag that `embedder:0.1.2` reads (default `0`, so normal runs are unaffected). The target refuses to run if the embedder isn't on that image: run `make embedder-up` once first.
+
+**Symptoms:** answers still arrive and are correct, only slower. Nothing is an error: no 5xx, no WARNING, the retrieval scores and sources are the same as normal.
+
+**Langfuse evidence** (`make drill-report DRILL=embedder-slow`):
+
+| Trace | `chat` | `embed-query` | `retrieve` | `generate` |
+|---|---|---|---|---|
+| rag-eval-01 | 37.91 s | **4.02 s** | 0.02 s | 33.87 s |
+| rag-eval-05 | 7.88 s | **4.03 s** | 0.01 s | 3.84 s |
+| rag-eval-09 | 29.93 s | **4.03 s** | 0.01 s | 25.89 s (one 429, retried) |
+
+- Baseline `embed-query` median is 0.03 s; here it's 4.02–4.03 s in all three traces, with almost no spread. A constant is the signature of an injected or timeout-like delay, not load.
+- `retrieve` is unchanged (0.01 s) and the top-1 scores are the baseline's (mean 0.806), so Qdrant and the vectors are fine.
+- **The total `chat` latency alone points at the wrong span.** Two of the three turns were slow because of the LLM (`generate` 34 s and 26 s, the free model on a bad minute), which hides a 4 s embedder delay. Only the per-observation view separates them: look for the span that is the same size every time, and compare each span with the same span in a normal trace.
+- Item 05 is the clean case: `chat` 7.88 s of which `embed-query` is 4.03 s (half), `generate` 3.84 s.
+
+**Root cause:** the embedder takes 4 s per request. `kubectl -n app get deploy embedder -o yaml` shows `EMBED_LATENCY_MS=4000`; the embedder pod itself is Ready and healthy, so only the trace gives it away. In production the same trace shape would mean a CPU-starved or throttled embedder, or a network problem on the way to it.
+
+**Restore:** `make drill-embedder-slow-off` sets `EMBED_LATENCY_MS=0` and waits for the rollout. `drill-check` shows `embedder EMBED_LATENCY_MS: 0`.

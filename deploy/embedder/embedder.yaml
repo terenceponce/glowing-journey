@@ -20,7 +20,7 @@ spec:
     spec:
       containers:
         - name: embedder
-          image: embedder:0.1.1
+          image: embedder:0.1.2
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
@@ -36,6 +36,9 @@ spec:
             # BGE's recommended instruction for short retrieval queries; applied when kind=query.
             - name: QUERY_PREFIX
               value: "Represent this sentence for searching relevant passages: "
+            # Fault switch for the failure drills (make drill-embedder-slow-on / -off): delay per request, in ms.
+            - name: EMBED_LATENCY_MS
+              value: "0"
           readinessProbe:
             httpGet:
               path: /healthz
