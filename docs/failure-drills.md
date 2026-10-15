@@ -73,3 +73,26 @@ reference baseline: 3 answered, chat latency median 6.78s, 5 chunks per turn, to
 **Root cause:** the embedder takes 4 s per request. `kubectl -n app get deploy embedder -o yaml` shows `EMBED_LATENCY_MS=4000`; the embedder pod itself is Ready and healthy, so only the trace gives it away. In production the same trace shape would mean a CPU-starved or throttled embedder, or a network problem on the way to it.
 
 **Restore:** `make drill-embedder-slow-off` sets `EMBED_LATENCY_MS=0` and waits for the rollout. `drill-check` shows `embedder EMBED_LATENCY_MS: 0`.
+
+## 3. Retrieval returning irrelevant chunks (wrong collection)
+
+**Trigger:** `make drill-wrong-collection-on` seeds a small collection `recipes` (`scripts/drill_collection.py`: 15 passages about cooking, gardening, travel and music, embedded by the real embedder, with the same payload fields as `docs`) and sets `COLLECTION=recipes` on the chatbot Deployment. `docs` isn't touched. It stands for a deployment pointed at a stale or foreign collection: a valid collection with the right vector size, which answers every query with something.
+
+**Symptoms:** no errors. Every answer to a Kubernetes question is "I don't know from the documentation" (the prompt's grounding rule works, so the model doesn't invent anything), after a fast turn: about 4 s, 416 prompt tokens. A user would report "the bot suddenly knows nothing". Two of the three first requests also failed with a 502 (RateLimitError 429), see drill 4; the run was resumed with a larger retry budget (`DRILL_LLM_RETRIES=7`) and only the failed items were asked again.
+
+**Langfuse evidence** (`make drill-report DRILL=wrong-collection`), the `retrieve` observation of the rag-eval-09 trace `31106c76…`:
+
+```
+RETRIEVER retrieve  0.00s  collection=recipes top_k=5 hits=5 scores=[0.4454, 0.4287, 0.4182, 0.4078, 0.4005]
+    sources=['fitness/marathon.md', 'garden/compost.md', 'music/guitar.md', 'recipes/sourdough.md', 'travel/packing.md']
+```
+
+- `retrieve.input.collection` is `recipes`, not `docs`. It's the first thing to compare.
+- `hits=5` and level DEFAULT: retrieval "worked". That's why nothing is flagged.
+- The scores give it away: top-1 **0.47** against **0.81** in the baseline for the same three questions (0.4–0.49 here, 0.71–0.86 there). A top-1 below about 0.6 means the question has no good match in the collection.
+- The sources are `garden/…`, `recipes/…`, `travel/…`: not Kubernetes docs, and different pages from baseline (`workloads/controllers/replicaset.md` for item 01).
+- Downstream effects, all consequences rather than causes: `chat-completion` input is 413 tokens against 1030 (the chunks are short), output is 9–16 tokens (the refusal), and the answer is the refusal sentence. The tokens look like "cheap and fast", which a dashboard would score as good.
+
+**Root cause:** the chatbot searches the wrong collection. `kubectl -n app get deploy chatbot -o yaml` shows the `COLLECTION=recipes` override, which beats the `chatbot-config` ConfigMap (`docs`). A bad `filter` would show up in the same fields: right collection, but `sources` outside the expected pages. (The chatbot doesn't have a filter option, so only the collection was drilled.)
+
+**Restore:** `make drill-wrong-collection-off` removes the override, waits for the rollout and deletes `recipes`. `drill-check` shows `docs` with 3048 points and a normal answer.
