@@ -96,3 +96,33 @@ RETRIEVER retrieve  0.00s  collection=recipes top_k=5 hits=5 scores=[0.4454, 0.4
 **Root cause:** the chatbot searches the wrong collection. `kubectl -n app get deploy chatbot -o yaml` shows the `COLLECTION=recipes` override, which beats the `chatbot-config` ConfigMap (`docs`). A bad `filter` would show up in the same fields: right collection, but `sources` outside the expected pages. (The chatbot doesn't have a filter option, so only the collection was drilled.)
 
 **Restore:** `make drill-wrong-collection-off` removes the override, waits for the rollout and deletes `recipes`. `drill-check` shows `docs` with 3048 points and a normal answer.
+
+## 4. LLM timeouts and rate limits
+
+Two faults in one drill, because the free model supplies the second one for free.
+
+**Trigger:** `make drill-llm-timeout-on` sets `LLM_TIMEOUT=1` (`DRILL_LLM_TIMEOUT`) on the chatbot: the per-request timeout of the LLM call drops from 60 s to 1 s, shorter than any real GLM answer. The **429s** need no trigger. Z.AI's free `glm-4.7-flash` returns them all the time (code 1305 "service may be temporarily overloaded", sometimes 1302 "rate limit reached"), so they turned up in every drill's traffic and are used here as real evidence.
+
+**Symptoms:** `POST /chat` returns **502** `LLM call failed: APITimeoutError` (or `RateLimitError 429`) after 7–10 s, from three LLM attempts (the drill's `DRILL_LLM_RETRIES=2`, so 3 attempts with 2 s and 4 s backoff). All three items failed. Without the timeout fault, a 429 is retried and usually the second attempt answers: 8 of the 11 turns of drills 2 and 3 needed at least one retry.
+
+**Langfuse evidence** (`make drill-report DRILL=llm-timeout`), trace `22800823…` (rag-eval-01):
+
+```
+SPAN       chat             9.87s  ERROR: LLM call failed: APITimeoutError
+RETRIEVER  retrieve         0.01s  hits=5 scores=[0.86, …]   <- retrieval is fine
+SPAN       generate         9.85s  ERROR: gave up after 3 attempts
+                                  errors=['attempt 1: RateLimitError 429', 'attempt 2: RateLimitError 429', 'attempt 3: APITimeoutError']
+GENERATION chat-completion  0.95s  ERROR: Error code: 429 - {'error': {'code': '1305', 'message': 'The service may be temporarily overloaded, …
+GENERATION chat-completion  0.65s  ERROR: Error code: 429 - …
+GENERATION chat-completion  1.01s  ERROR: Request timed out.
+```
+
+- Everything before the LLM is healthy (`embed-query` 0.01 s, `retrieve` 0.01 s with normal scores). `generate` is the first ERROR, and it has `attempts` and `errors` in its metadata: one entry per try.
+- **Each attempt is its own `chat-completion` generation**, and its status message tells the two failure kinds apart. A rate limit is an immediate `Error code: 429 - {'code': '1305' …}` (0.5–0.95 s), which is Z.AI answering. A timeout is `Request timed out.` after **exactly the timeout** (1.00 s, 0.99–1.01 s over the three traces), which is our client giving up. A timeout with a constant duration equal to a configured limit is a configuration fingerprint; real network timeouts vary.
+- A 429 that is retried and wins is **not an ERROR**: the turn is level WARNING with "succeeded after 2 attempts" (see item 09 in drill 2, trace `9901c25c…`, and all three turns of drill 3). Filter `generate` by level WARNING to measure how often the model rate-limits. Here, 11 of 14 answered turns across the drills needed a retry.
+- Same fingerprint on the 429 side: trace `c0c6a126…` (drill 3) and `2a8f5d2f…` above show `gave up after 3 attempts` with three 429s and no timeout, i.e. a real Z.AI overload, nothing broken on our side. There is no usage on failed attempts, so they cost no tokens.
+- `chat-completion` input `prompt=rag-chat v2` is recorded on each failed attempt too, so you can see which prompt was being tried.
+
+**Root cause:** (a) timeouts: the client timeout (`LLM_TIMEOUT=1`) is below the model's latency. The answered turns elsewhere took 1–4 s for the final call and sometimes 20–50 s, so any timeout under about 60 s fails requests the provider would have answered. `kubectl -n app get deploy chatbot -o yaml` shows the override. (b) 429s: the provider's capacity on the free tier. The only levers are the retry count and backoff (`LLM_MAX_RETRIES`, `LLM_BACKOFF_BASE/MAX`; the experiment runner uses 7 retries up to 60 s), or a paid plan.
+
+**Restore:** `make drill-llm-timeout-off` removes the override (back to the 60 s default) and waits for the rollout.
