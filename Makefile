@@ -14,7 +14,7 @@ QDRANT_CHART_VERSION ?= 1.19.2
 
 # Locally built images, loaded into kind (no registry). Bump the tag when the code changes.
 PLATFORM       ?= linux/arm64
-EMBEDDER_IMAGE ?= embedder:0.1.1
+EMBEDDER_IMAGE ?= embedder:0.1.2
 INGEST_IMAGE   ?= ingest:0.1.0
 CHATBOT_IMAGE  ?= chatbot:0.4.0
 
@@ -70,9 +70,23 @@ EXPERIMENT_BACKOFF_BASE ?= 30
 EXPERIMENT_BACKOFF_MAX  ?= 180
 EXPERIMENT_PAUSE        ?= 3
 EXPERIMENT_TIMEOUT      ?= 900
+EXPERIMENT_JUDGE        ?= true
 EXPERIMENT_LLM_MAX_RETRIES  ?= 7
 EXPERIMENT_LLM_BACKOFF_BASE ?= 2
 EXPERIMENT_LLM_BACKOFF_MAX  ?= 60
+
+# Failure drills (docs/failure-drills.md). Each fault has a -on and an -off target; drill-restore runs every -off.
+DRILL                  ?=
+COMPARE                ?= baseline
+DRILL_ITEMS            ?= rag-eval-01,rag-eval-05,rag-eval-09
+DRILL_JUDGE            ?= false
+DRILL_LLM_RETRIES      ?= 2
+DRILL_EMBED_LATENCY_MS ?= 4000
+DRILL_COLLECTION       ?= recipes
+DRILL_PROMPT_LABEL     ?= drill-hallucinate
+DRILL_TOP_K            ?= 20
+DRILL_LLM_TIMEOUT      ?= 1
+DRILL_ROLLOUT          := --timeout=3m
 
 .PHONY: help cluster-up cluster-down cluster-status \
 	langfuse-prereqs langfuse-secrets langfuse-up langfuse-down langfuse-purge langfuse-status langfuse-ui langfuse-test \
@@ -82,7 +96,11 @@ EXPERIMENT_LLM_BACKOFF_MAX  ?= 60
 	chatbot-secret chatbot-image chatbot-config chatbot-langfuse-setup chatbot-up chatbot-down chatbot-status \
 	chatbot-logs chatbot-ui chatbot-test chatbot-trace chatbot-feedback \
 	judge-config judge-setup judge \
-	experiment-config experiment-setup experiment experiment-check
+	experiment-config experiment-setup experiment experiment-check \
+	drill-run drill-report drill-check drill-restore \
+	drill-qdrant-down-on drill-qdrant-down-off drill-embedder-slow-on drill-embedder-slow-off \
+	drill-wrong-collection-on drill-wrong-collection-off drill-llm-timeout-on drill-llm-timeout-off \
+	drill-hallucination-on drill-hallucination-off drill-token-spike-on drill-token-spike-off
 
 help: ## List targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-16s %s\n", $$1, $$2}'
@@ -325,6 +343,7 @@ experiment-config: judge-config ## Write the experiment-config ConfigMap and the
 		--from-literal=EXPERIMENT_MAX_ATTEMPTS=$(EXPERIMENT_MAX_ATTEMPTS) \
 		--from-literal=EXPERIMENT_BACKOFF_BASE=$(EXPERIMENT_BACKOFF_BASE) --from-literal=EXPERIMENT_BACKOFF_MAX=$(EXPERIMENT_BACKOFF_MAX) \
 		--from-literal=EXPERIMENT_PAUSE=$(EXPERIMENT_PAUSE) --from-literal=EXPERIMENT_TIMEOUT=$(EXPERIMENT_TIMEOUT) \
+		--from-literal=EXPERIMENT_JUDGE=$(EXPERIMENT_JUDGE) \
 		--from-literal=EXPERIMENT_LLM_MAX_RETRIES=$(EXPERIMENT_LLM_MAX_RETRIES) \
 		--from-literal=EXPERIMENT_LLM_BACKOFF_BASE=$(EXPERIMENT_LLM_BACKOFF_BASE) \
 		--from-literal=EXPERIMENT_LLM_BACKOFF_MAX=$(EXPERIMENT_LLM_BACKOFF_MAX) \
@@ -357,3 +376,81 @@ experiment-check: ## Check the defaults are back (top-k, prompt label, model, ch
 	$(KUBECTL) -n app exec -i deploy/chatbot -- python - $(TOP_K) $(LANGFUSE_PROMPT_LABEL) $(LLM_MODEL) \
 		"$$ingested" $(CHUNK_SIZE)/$(CHUNK_OVERLAP) < scripts/experiment_check.py
 	$(MAKE) --no-print-directory chatbot-test Q="What is a Pod?" SESSION=experiment-check
+
+# ---- Failure drills (docs/failure-drills.md) ----
+# Faults live in the cluster (a scaled-down Qdrant, an env var on a Deployment), never in the chatbot's code paths
+# for normal use. -on switches one on, -off restores it; both are safe to repeat.
+
+drill-run: ## Send the drill's traffic: DRILL_ITEMS through the runner as dataset run drill-$(DRILL), no overrides (DRILL=<name>)
+	@test -n "$(DRILL)" || (echo "usage: make drill-run DRILL=<name> [DRILL_ITEMS=...] [DRILL_JUDGE=true]"; exit 1)
+	$(MAKE) --no-print-directory experiment EXPERIMENT_CONFIG=as-deployed EXPERIMENT_RUN=drill-$(DRILL) \
+		EXPERIMENT_ITEMS=$(DRILL_ITEMS) EXPERIMENT_JUDGE=$(DRILL_JUDGE) EXPERIMENT_MAX_ATTEMPTS=1 \
+		EXPERIMENT_LLM_MAX_RETRIES=$(DRILL_LLM_RETRIES) EXPERIMENT_LLM_BACKOFF_BASE=2 EXPERIMENT_LLM_BACKOFF_MAX=8
+
+drill-report: ## Read the drill's traces back from Langfuse, next to a reference run (DRILL=<name> COMPARE=baseline)
+	@test -n "$(DRILL)" || (echo "usage: make drill-report DRILL=<name> [COMPARE=baseline]"; exit 1)
+	$(KUBECTL) -n app exec -i deploy/chatbot -- python - drill-$(DRILL) $(COMPARE) < scripts/drill_report.py
+
+drill-qdrant-down-on: ## Drill: scale Qdrant to 0 replicas
+	$(KUBECTL) -n qdrant scale statefulset/qdrant --replicas=0
+	$(KUBECTL) -n qdrant wait --for=delete pod/qdrant-0 --timeout=2m
+
+drill-qdrant-down-off: ## Restore: Qdrant back to 1 replica (its PVC kept the collections)
+	$(KUBECTL) -n qdrant scale statefulset/qdrant --replicas=1
+	$(KUBECTL) -n qdrant rollout status statefulset/qdrant $(DRILL_ROLLOUT)
+
+drill-embedder-slow-on: ## Drill: add DRILL_EMBED_LATENCY_MS to every embedder request (needs make embedder-up once, image 0.1.2)
+	@test "$$($(KUBECTL) -n app get deploy/embedder -o jsonpath='{.spec.template.spec.containers[0].image}')" = "$(EMBEDDER_IMAGE)" \
+		|| (echo "the embedder isn't running $(EMBEDDER_IMAGE): run make embedder-up first"; exit 1)
+	$(KUBECTL) -n app set env deploy/embedder EMBED_LATENCY_MS=$(DRILL_EMBED_LATENCY_MS)
+	$(KUBECTL) -n app rollout status deploy/embedder $(DRILL_ROLLOUT)
+
+drill-embedder-slow-off: ## Restore: no artificial latency in the embedder
+	$(KUBECTL) -n app set env deploy/embedder EMBED_LATENCY_MS=0
+	$(KUBECTL) -n app rollout status deploy/embedder $(DRILL_ROLLOUT)
+
+drill-wrong-collection-on: ## Drill: seed the unrelated collection DRILL_COLLECTION and point the chatbot at it
+	$(KUBECTL) -n app exec -i deploy/chatbot -- python - seed $(DRILL_COLLECTION) < scripts/drill_collection.py
+	$(KUBECTL) -n app set env deploy/chatbot COLLECTION=$(DRILL_COLLECTION)
+	$(KUBECTL) -n app rollout status deploy/chatbot $(DRILL_ROLLOUT)
+
+drill-wrong-collection-off: ## Restore: the chatbot back on its configured collection, the drill collection deleted
+	$(KUBECTL) -n app set env deploy/chatbot COLLECTION-
+	$(KUBECTL) -n app rollout status deploy/chatbot $(DRILL_ROLLOUT)
+	$(KUBECTL) -n app exec -i deploy/chatbot -- python - delete $(DRILL_COLLECTION) < scripts/drill_collection.py
+
+drill-llm-timeout-on: ## Drill: the chatbot's LLM timeout drops to DRILL_LLM_TIMEOUT seconds, shorter than any real answer
+	$(KUBECTL) -n app set env deploy/chatbot LLM_TIMEOUT=$(DRILL_LLM_TIMEOUT)
+	$(KUBECTL) -n app rollout status deploy/chatbot $(DRILL_ROLLOUT)
+
+drill-llm-timeout-off: ## Restore: the chatbot's default LLM timeout (60 s)
+	$(KUBECTL) -n app set env deploy/chatbot LLM_TIMEOUT-
+	$(KUBECTL) -n app rollout status deploy/chatbot $(DRILL_ROLLOUT)
+
+drill-hallucination-on: ## Drill: a prompt version that tells the model to always answer, under label DRILL_PROMPT_LABEL (never production), served by the chatbot
+	$(KUBECTL) -n app exec -i deploy/chatbot -- python - on $(DRILL_PROMPT_LABEL) < scripts/drill_prompt.py
+	$(KUBECTL) -n app set env deploy/chatbot LANGFUSE_PROMPT_LABEL=$(DRILL_PROMPT_LABEL)
+	$(KUBECTL) -n app rollout status deploy/chatbot $(DRILL_ROLLOUT)
+
+drill-hallucination-off: ## Restore: the chatbot back on production, the drill label removed
+	$(KUBECTL) -n app set env deploy/chatbot LANGFUSE_PROMPT_LABEL-
+	$(KUBECTL) -n app rollout status deploy/chatbot $(DRILL_ROLLOUT)
+	$(KUBECTL) -n app exec -i deploy/chatbot -- python - off $(DRILL_PROMPT_LABEL) < scripts/drill_prompt.py
+
+drill-token-spike-on: ## Drill: the chatbot retrieves DRILL_TOP_K chunks per question instead of 5
+	$(KUBECTL) -n app set env deploy/chatbot TOP_K=$(DRILL_TOP_K)
+	$(KUBECTL) -n app rollout status deploy/chatbot $(DRILL_ROLLOUT)
+
+drill-token-spike-off: ## Restore: TOP_K back to the configured value
+	$(KUBECTL) -n app set env deploy/chatbot TOP_K-
+	$(KUBECTL) -n app rollout status deploy/chatbot $(DRILL_ROLLOUT)
+
+drill-restore: drill-qdrant-down-off drill-embedder-slow-off drill-llm-timeout-off drill-token-spike-off drill-wrong-collection-off drill-hallucination-off ## Switch every fault off
+	@echo "all drill faults are off; run make drill-check"
+
+drill-check: ## No fault left (no env overrides, Qdrant and embedder up), defaults back, and the chatbot answers
+	@echo "chatbot env overrides (expected: only ZAI_API_KEY):"; \
+	$(KUBECTL) -n app get deploy/chatbot -o jsonpath='{range .spec.template.spec.containers[0].env[*]}  {.name}{"\n"}{end}'
+	@echo "embedder EMBED_LATENCY_MS: $$($(KUBECTL) -n app get deploy/embedder -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="EMBED_LATENCY_MS")].value}')"
+	@echo "qdrant ready replicas: $$($(KUBECTL) -n qdrant get statefulset/qdrant -o jsonpath='{.status.readyReplicas}')"
+	@$(MAKE) --no-print-directory experiment-check

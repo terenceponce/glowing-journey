@@ -26,13 +26,18 @@ Built for the free model, which often answers 429:
   - an item that fails every attempt is recorded as failed and the run moves on; it never crashes the run
   - the summary has the success, skipped and failure counts, and the run's averages read back from Langfuse
 
+Failure drills (docs/failure-drills.md) reuse the runner as their traffic source. For that:
+  - the config `as-deployed` sends no top_k or prompt_label, so the chatbot's own (possibly faulty) settings apply
+  - EXPERIMENT_JUDGE=false skips the judge and the retrieval-hit score (a drill reads the traces instead)
+  - a failed item records the chatbot's error, and the summary says which
+
 Config is chosen by name from CONFIGS. Chunking can't be switched per request (it's how `docs` was ingested), so
 a config names the chunking it expects and the run refuses to start if the ingest-config ConfigMap
 (INGEST_CHUNK_SIZE / INGEST_CHUNK_OVERLAP) doesn't match.
 
 Env: EXPERIMENT_CONFIG, EXPERIMENT_RUN, EXPERIMENT_DATASET, EXPERIMENT_ITEMS (comma-separated item ids, default
 all), CHATBOT_URL, EXPERIMENT_MAX_ATTEMPTS, EXPERIMENT_BACKOFF_BASE, EXPERIMENT_BACKOFF_MAX, EXPERIMENT_PAUSE,
-EXPERIMENT_TIMEOUT, EXPERIMENT_LLM_MAX_RETRIES, EXPERIMENT_LLM_BACKOFF_BASE, EXPERIMENT_LLM_BACKOFF_MAX, EXPERIMENT_ALLOWED_MODELS, INGEST_CHUNK_SIZE, INGEST_CHUNK_OVERLAP, plus everything judge.py
+EXPERIMENT_TIMEOUT, EXPERIMENT_JUDGE, EXPERIMENT_LLM_MAX_RETRIES, EXPERIMENT_LLM_BACKOFF_BASE, EXPERIMENT_LLM_BACKOFF_MAX, EXPERIMENT_ALLOWED_MODELS, INGEST_CHUNK_SIZE, INGEST_CHUNK_OVERLAP, plus everything judge.py
 reads (JUDGE_*, ZAI_API_KEY, LANGFUSE_*). Needs show_trace.py from the chatbot image on PYTHONPATH.
 """
 
@@ -61,6 +66,9 @@ CONFIGS = {
     "top-k-8": {**DEFAULTS, "top_k": 8},
     "prompt-concise": {**DEFAULTS, "prompt_label": "concise"},
     "chunks-600": {**DEFAULTS, "chunking": "600/100"},  # needs `make ingest CHUNK_SIZE=600 CHUNK_OVERLAP=100` first
+    # The failure drills: no overrides, so the chatbot uses whatever it is deployed with (a fault switch may have
+    # changed TOP_K, the prompt label, the collection, ...). The response says what it used.
+    "as-deployed": {**DEFAULTS, "top_k": None, "prompt_label": None},
 }
 
 CONFIG_NAME = os.environ["EXPERIMENT_CONFIG"]
@@ -78,6 +86,7 @@ LLM_RETRY = {
     "backoff_base": float(os.environ.get("EXPERIMENT_LLM_BACKOFF_BASE", "2")),
     "backoff_max": float(os.environ.get("EXPERIMENT_LLM_BACKOFF_MAX", "60")),
 }
+JUDGE = os.environ.get("EXPERIMENT_JUDGE", "true").lower() != "false"
 ALLOWED_MODELS = {m.strip() for m in os.environ.get("EXPERIMENT_ALLOWED_MODELS", "glm-4.7-flash").split(",") if m.strip()}
 HIT_SCORE = "retrieval-hit"
 REFUSAL = "don't know from the documentation"
@@ -107,6 +116,11 @@ class Record:
     scores: dict = field(default_factory=dict)
 
 
+def describe_config(config: dict) -> str:
+    return (f"top_k={config['top_k'] or 'as deployed'} prompt={config['prompt_label'] or 'as deployed'} "
+            f"model={config['model']} chunking={config['chunking']}")
+
+
 def check_config(config: dict) -> None:
     if config["model"] not in ALLOWED_MODELS or judge.MODEL not in ALLOWED_MODELS:
         sys.exit(f"refusing to run: models must be in {sorted(ALLOWED_MODELS)} (free model only)")
@@ -124,8 +138,7 @@ def ask(api: httpx.Client, item, config: dict, experiment: dict, stats: Counter)
         "user_id": "experiment",
         "message": item.input["question"],
         "history": item.input.get("history", []),  # fixed; empty for standalone questions
-        "top_k": config["top_k"],
-        "prompt_label": config["prompt_label"],
+        **{k: config[k] for k in ("top_k", "prompt_label") if config[k] is not None},  # None: as deployed
         "model": config["model"],
         "retry": LLM_RETRY,
         "experiment": {
@@ -148,7 +161,7 @@ def ask(api: httpx.Client, item, config: dict, experiment: dict, stats: Counter)
                 data = resp.json()
                 if data["prompt"]["fallback"]:
                     last = "the chatbot used its built-in fallback prompt (Langfuse unreachable)"
-                elif (data["top_k"], data["model"]) != (config["top_k"], config["model"]):
+                elif data["model"] != config["model"] or config["top_k"] not in (None, data["top_k"]):
                     raise ChatFailed(f"chatbot ignored the overrides: top_k={data['top_k']} model={data['model']}")
                 else:
                     data["chat_attempts"] = attempt
@@ -299,8 +312,7 @@ def summarize(records: list[Record], config: dict, stats: Counter, judge_stats: 
         "minutes": round(seconds / 60, 1),
     }
     print("\nsummary")
-    print(f"  run {RUN} (config {CONFIG_NAME}: top_k={config['top_k']} prompt={config['prompt_label']} "
-          f"model={config['model']} chunking={config['chunking']}), dataset {DATASET}, {result['minutes']} min")
+    print(f"  run {RUN} (config {CONFIG_NAME}: {describe_config(config)}), dataset {DATASET}, {result['minutes']} min")
     print(f"  chat              ok={stats['chat:ok']}  skipped={stats['chat:skipped']}  failed={stats['chat:failed']}"
           f"  (requests={stats['chat_requests']})")
     for name in [HIT_SCORE, *(e["name"] for e in judge_prompts.EVALUATORS)]:
@@ -335,8 +347,7 @@ def main() -> None:
     since = min(i.created_at for i in dataset.items) - timedelta(days=1)  # experiments can't predate the dataset
     experiment_id = langfuse._create_observation_id(seed=f"{dataset.id}:{RUN}")  # stable, so re-runs continue it
     linked, earlier_errors = answered_items(experiment_id, since)
-    description = (f"{CONFIG_NAME}: top_k={config['top_k']}, prompt label {config['prompt_label']}, "
-                   f"model {config['model']}, chunking {config['chunking']}")
+    description = f"{CONFIG_NAME}: {describe_config(config)}"
     experiment = {
         "id": experiment_id, "name": RUN, "description": description, "dataset_id": dataset.id,
         "metadata": {"config": CONFIG_NAME, **{k: str(v) for k, v in config.items()}},
@@ -376,6 +387,9 @@ def main() -> None:
                 continue
             if item.id not in expected:
                 print(f"  note: {item.id} isn't in experiment_dataset.py", flush=True)
+            if not JUDGE:
+                print(f"  not scored (EXPERIMENT_JUDGE=false)  latency {record.latency:.1f}s  tokens {record.prompt_tokens}+{record.output_tokens}", flush=True)
+                continue
             score_item(record, turn, stats, judge_stats, failed)
             if record.hit is not None:
                 print(f"  {HIT_SCORE}={record.hit:g}  latency {record.latency:.1f}s  tokens {record.prompt_tokens}+{record.output_tokens}", flush=True)
