@@ -126,3 +126,27 @@ GENERATION chat-completion  1.01s  ERROR: Request timed out.
 **Root cause:** (a) timeouts: the client timeout (`LLM_TIMEOUT=1`) is below the model's latency. The answered turns elsewhere took 1–4 s for the final call and sometimes 20–50 s, so any timeout under about 60 s fails requests the provider would have answered. `kubectl -n app get deploy chatbot -o yaml` shows the override. (b) 429s: the provider's capacity on the free tier. The only levers are the retry count and backoff (`LLM_MAX_RETRIES`, `LLM_BACKOFF_BASE/MAX`; the experiment runner uses 7 retries up to 60 s), or a paid plan.
 
 **Restore:** `make drill-llm-timeout-off` removes the override (back to the 60 s default) and waits for the rollout.
+
+## 5. Token cost spike (huge context)
+
+**Trigger:** `make drill-token-spike-on` sets `TOP_K=20` (`DRILL_TOP_K`) on the chatbot, four times the default 5: a config change that passes review because every answer still looks right. `-off` removes the override.
+
+**Symptoms:** nothing visibly breaks. Answers are normal, retrieval scores are normal, and Langfuse shows **$0.00** for every turn because `glm-4.7-flash` is free. The signal is the token count, and latency when the model is slow (the final LLM call took 35 s on one turn, but 3–4.5 s on the other two, so latency is not a reliable signal here).
+
+**Langfuse evidence** (`make drill-report DRILL=token-spike COMPARE=baseline`, the final `chat-completion` of each answered turn):
+
+| Item | Prompt tokens, baseline (5 chunks) | Prompt tokens, drill (20 chunks) | Output tokens, baseline → drill |
+|---|---|---|---|
+| rag-eval-01 | 687 | **2930** | 57 → 84 |
+| rag-eval-05 | 1072 | **3970** | 206 → 220 |
+| rag-eval-09 | 1330 | **4791** | 164 → 209 |
+| mean | 1030 | **3897** (3.8×) | 159 → 171 |
+
+- `retrieve` shows `top_k=20 hits=20` and 20 scores. Against the baseline's `top_k=5`, that's the cause. The scores prove the extra chunks are mostly noise: the top-1 is the same (0.808 against 0.806), and ranks 6–20 fall from 0.77 to about 0.65.
+- The generation's `usageDetails` carries `input`, `output` and `total`. Prompt tokens are the same four-fold step in every trace, while output tokens barely moved, so the growth is the context, not longer answers.
+- The cost field is useless on the free model (`cost={"input":0,"output":0,"total":0}`), so the cost is estimated from the tokens at `glm-5.3-flash` prices ($0.15 per 1M input, $0.50 per 1M output; `drill-report` does this, and no paid call was made): **$0.00023 per answered turn in the baseline against $0.00067 in the drill, $0.23 against $0.67 per 1000 turns (2.9×)**. The cost rises less than the prompt (3.8×) because output tokens, priced at 3.3× the input, didn't grow and are a big share of the baseline bill. At 100,000 turns a month this fault is about $44 more. Cached input would lower both numbers a little (the price list has $0.03 per 1M for cached input; the drill ignores that discount).
+- Failed attempts have no usage, so they didn't add to it: one request of the first pass (rag-eval-05, trace `bc958178…`, ERROR) was rate-limited three times and asked again, without any token cost.
+
+**Root cause:** `TOP_K=20` on the chatbot Deployment (`kubectl -n app get deploy chatbot -o yaml`) overriding `TOP_K=5` in `chatbot-config`. The fix is the config, and the lesson is to alert on mean prompt tokens per turn, not on the dollar cost.
+
+**Restore:** `make drill-token-spike-off` removes the override and waits for the rollout. `drill-check` shows `TOP_K: 5`.
